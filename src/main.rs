@@ -17,6 +17,15 @@ const STATE_BASE_DIR: &str = "/run/vtether";
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
+// Conntrack reaper interval
+const REAP_INTERVAL_SECS: u64 = 120;
+
+// State-based timeouts matching Linux nf_conntrack patterns
+const TCP_TIMEOUT_ESTABLISHED: u64 = 432_000; // 5 days
+const TCP_TIMEOUT_FIN_WAIT: u64 = 120;
+const TCP_TIMEOUT_CLOSE: u64 = 10;
+const UDP_TIMEOUT: u64 = 180;
+
 // ---- CLI ----
 
 #[derive(Parser)]
@@ -78,19 +87,12 @@ struct Config {
     /// Max conntrack entries (default: 65536)
     #[serde(default = "default_conntrack_size")]
     conntrack_size: u32,
-    /// Conntrack idle timeout in seconds (default: 300)
-    #[serde(default = "default_conntrack_timeout")]
-    conntrack_timeout: u64,
     #[serde(default)]
     routes: Vec<RouteConfig>,
 }
 
 fn default_conntrack_size() -> u32 {
     65536
-}
-
-fn default_conntrack_timeout() -> u64 {
-    300
 }
 
 fn default_protocol() -> String {
@@ -191,13 +193,14 @@ unsafe impl aya::Pod for RouteStats {}
 
 // ---- Main ----
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     env_logger::init();
 
     match cli.command {
         Commands::Proxy { action } => match action {
-            ProxyAction::Up { config, pin_path } => proxy_up(config, pin_path),
+            ProxyAction::Up { config, pin_path } => proxy_up(config, pin_path).await,
             ProxyAction::Destroy { pin_path } => proxy_destroy(pin_path),
         },
         Commands::Setup => setup(),
@@ -266,7 +269,6 @@ fn get_default_interface() -> anyhow::Result<String> {
         .args(["-4", "route", "show", "default"])
         .output()
         .context("failed to run `ip route`")?;
-    // Output like: "default via 192.168.1.1 dev eth0 proto ..."
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -281,9 +283,7 @@ fn get_default_interface() -> anyhow::Result<String> {
 
 fn setup() -> anyhow::Result<()> {
     let vtether_bin = std::env::current_exe().context("failed to determine vtether binary path")?;
-    let vtether_bin = vtether_bin
-        .canonicalize()
-        .unwrap_or(vtether_bin);
+    let vtether_bin = vtether_bin.canonicalize().unwrap_or(vtether_bin);
 
     let default_iface = get_default_interface().unwrap_or_else(|_| "eth0".to_string());
 
@@ -364,7 +364,6 @@ WantedBy=multi-user.target
 }
 
 fn remove() -> anyhow::Result<()> {
-    // Stop and disable the service
     let _ = std::process::Command::new("systemctl")
         .args(["stop", "vtether"])
         .status();
@@ -372,14 +371,12 @@ fn remove() -> anyhow::Result<()> {
         .args(["disable", "vtether"])
         .status();
 
-    // Remove unit file
     if PathBuf::from(SYSTEMD_UNIT_PATH).exists() {
         std::fs::remove_file(SYSTEMD_UNIT_PATH)
             .with_context(|| format!("failed to remove {}", SYSTEMD_UNIT_PATH))?;
         println!("  removed {}", SYSTEMD_UNIT_PATH);
     }
 
-    // Reload systemd
     let _ = std::process::Command::new("systemctl")
         .args(["daemon-reload"])
         .status();
@@ -388,7 +385,7 @@ fn remove() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
+async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {}", config_path.display()))?;
     let config: Config =
@@ -403,7 +400,10 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     );
 
     if config.routes.is_empty() {
-        println!("vtether: no routes defined in {}, nothing to do", config_path.display());
+        println!(
+            "vtether: no routes defined in {}, nothing to do",
+            config_path.display()
+        );
         return Ok(());
     }
 
@@ -449,7 +449,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
             env!("OUT_DIR"),
             "/vtether-forward"
         )))
-    .context("failed to load eBPF bytecode")?;
+        .context("failed to load eBPF bytecode")?;
 
     // Populate NAT_CONFIG map
     {
@@ -493,7 +493,8 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         .program_mut("vtether_xdp")
         .context("vtether_xdp program not found")?
         .try_into()?;
-    prog.load().context("failed to load XDP program into kernel")?;
+    prog.load()
+        .context("failed to load XDP program into kernel")?;
 
     // Attach first, then pin — so partial failures don't leave stale pins.
     let link_id = prog
@@ -541,28 +542,56 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     }
 
     info!(
-        "proxy up: xdp on {}, snat_ip: {}, conntrack: {}, timeout: {}s",
-        config.interface, snat_ip, config.conntrack_size, config.conntrack_timeout
+        "proxy up: xdp on {}, snat_ip: {}, conntrack: {}",
+        config.interface, snat_ip, config.conntrack_size
     );
     println!(
-        "vtether: proxy up (xdp on {}, snat_ip: {}, conntrack: {}, timeout: {}s)",
-        config.interface, snat_ip, config.conntrack_size, config.conntrack_timeout
+        "vtether: proxy up (xdp on {}, snat_ip: {}, conntrack: {})",
+        config.interface, snat_ip, config.conntrack_size
     );
     for (port, to, proto) in &parsed_routes {
         println!("  {} :{} -> {}", protocol_name(*proto), port, to);
         info!("route: {} :{} -> {}", protocol_name(*proto), port, to);
     }
 
-    // Block forever, running conntrack reaper every 2 minutes
-    let timeout_ns = config.conntrack_timeout * 1_000_000_000;
-    info!("starting conntrack reaper (interval: 120s, timeout: {}s)", config.conntrack_timeout);
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(120));
-        if let Err(e) = reap_conntrack(&pin_path, timeout_ns) {
-            log::warn!("conntrack reaper error: {:#}", e);
+    // Spawn conntrack reaper task
+    let reaper_pin_path = pin_path.clone();
+    let reaper_handle = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(REAP_INTERVAL_SECS));
+        info!(
+            "conntrack reaper started (interval: {}s, timeouts: tcp_est={}s tcp_fin={}s tcp_close={}s udp={}s)",
+            REAP_INTERVAL_SECS, TCP_TIMEOUT_ESTABLISHED, TCP_TIMEOUT_FIN_WAIT, TCP_TIMEOUT_CLOSE, UDP_TIMEOUT,
+        );
+        loop {
+            interval.tick().await;
+            if let Err(e) = reap_conntrack(&reaper_pin_path) {
+                log::warn!("conntrack reaper error: {:#}", e);
+            }
+        }
+    });
+
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("received SIGINT, shutting down");
+        }
+        _ = async {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate()
+            ).expect("failed to register SIGTERM handler");
+            sigterm.recv().await;
+        } => {
+            info!("received SIGTERM, shutting down");
         }
     }
+
+    reaper_handle.abort();
+    info!("proxy up exiting");
+    Ok(())
 }
+
+// ---- Conntrack reaper ----
 
 fn ktime_get_ns() -> u64 {
     let ts = nix::time::ClockId::CLOCK_BOOTTIME
@@ -571,7 +600,33 @@ fn ktime_get_ns() -> u64 {
     ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
 }
 
-fn reap_conntrack(pin_path: &std::path::Path, timeout_ns: u64) -> anyhow::Result<()> {
+/// Return the timeout in nanoseconds for a conntrack entry based on protocol and TCP state.
+fn conntrack_timeout_ns(protocol: u8, tcp_fin_state: u8) -> u64 {
+    let secs = if protocol == IPPROTO_TCP {
+        match tcp_fin_state {
+            0 => TCP_TIMEOUT_ESTABLISHED,
+            1 => TCP_TIMEOUT_FIN_WAIT,
+            _ => TCP_TIMEOUT_CLOSE,
+        }
+    } else {
+        UDP_TIMEOUT
+    };
+    secs * 1_000_000_000
+}
+
+fn conntrack_state_name(protocol: u8, tcp_fin_state: u8) -> &'static str {
+    if protocol == IPPROTO_TCP {
+        match tcp_fin_state {
+            0 => "ESTABLISHED",
+            1 => "FIN_WAIT",
+            _ => "CLOSE",
+        }
+    } else {
+        "ACTIVE"
+    }
+}
+
+fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<()> {
     let conntrack_out_path = pin_path.join("conntrack_out");
     let conntrack_in_path = pin_path.join("conntrack_in");
     if !conntrack_out_path.exists() || !conntrack_in_path.exists() {
@@ -596,7 +651,8 @@ fn reap_conntrack(pin_path: &std::path::Path, timeout_ns: u64) -> anyhow::Result
     let mut stale: Vec<(ConntrackKey, ConntrackValue)> = Vec::new();
     for item in conntrack_out.iter() {
         if let Ok((key, val)) = item {
-            if now.saturating_sub(val.last_seen_ns) > timeout_ns {
+            let timeout = conntrack_timeout_ns(key.protocol, val.tcp_fin_state);
+            if now.saturating_sub(val.last_seen_ns) > timeout {
                 stale.push((key, val));
             }
         }
@@ -613,13 +669,13 @@ fn reap_conntrack(pin_path: &std::path::Path, timeout_ns: u64) -> anyhow::Result
         let svc_port = u16::from_be(key.svc_port);
         let idle_secs = now.saturating_sub(val.last_seen_ns) / 1_000_000_000;
         info!(
-            "reaper: {} {}:{} -> :{} (idle {}s, fin_state={})",
+            "reaper: {} {}:{} -> :{} state={} idle={}s",
             protocol_name(key.protocol),
             client_ip,
             client_port,
             svc_port,
+            conntrack_state_name(key.protocol, val.tcp_fin_state),
             idle_secs,
-            val.tcp_fin_state,
         );
 
         let _ = conntrack_out.remove(key);
@@ -637,6 +693,8 @@ fn reap_conntrack(pin_path: &std::path::Path, timeout_ns: u64) -> anyhow::Result
 
     Ok(())
 }
+
+// ---- Other commands ----
 
 fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
     let prog_pin = pin_path.join("prog");

@@ -13,6 +13,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 nix = { version = "0.30", features = ["net", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
