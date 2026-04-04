@@ -818,19 +818,17 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
     // Read CONNTRACK_OUT map — count active connections
     let conntrack_out_path = pin_path.join("conntrack_out");
     if conntrack_out_path.exists() {
-        let map_data = MapData::from_pin(&conntrack_out_path)
-            .context("failed to load pinned CONNTRACK_OUT")?;
-        let map = Map::HashMap(map_data);
-        let conntrack: HashMap<_, ConntrackKey, ConntrackValue> =
-            HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
-
-        let mut count: usize = 0;
-        for item in conntrack.iter() {
-            if item.is_ok() {
-                count += 1;
-            }
+        match (|| -> anyhow::Result<usize> {
+            let map_data = MapData::from_pin(&conntrack_out_path)
+                .context("failed to load pinned CONNTRACK_OUT")?;
+            let map = Map::HashMap(map_data);
+            let conntrack: HashMap<_, ConntrackKey, ConntrackValue> =
+                HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
+            Ok(conntrack.iter().filter(|i| i.is_ok()).count())
+        })() {
+            Ok(count) => println!("\nActive connections: {}", count),
+            Err(e) => println!("\nActive connections: unknown ({:#})", e),
         }
-        println!("\nActive connections: {}", count);
     }
 
     Ok(())
