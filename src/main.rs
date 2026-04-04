@@ -35,6 +35,8 @@ enum Commands {
     },
     /// Install systemd unit file and default config
     Setup,
+    /// Disable systemd service and remove unit file
+    Remove,
     /// Show version information
     Version,
     /// Inspect active forwarding rules and connection metrics
@@ -199,6 +201,7 @@ fn main() -> anyhow::Result<()> {
             ProxyAction::Destroy { pin_path } => proxy_destroy(pin_path),
         },
         Commands::Setup => setup(),
+        Commands::Remove => remove(),
         Commands::Version => {
             print_version();
             Ok(())
@@ -357,6 +360,31 @@ WantedBy=multi-user.target
     println!("  2. systemctl start vtether");
     println!("  3. systemctl enable vtether  (optional, to start on boot)");
 
+    Ok(())
+}
+
+fn remove() -> anyhow::Result<()> {
+    // Stop and disable the service
+    let _ = std::process::Command::new("systemctl")
+        .args(["stop", "vtether"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "vtether"])
+        .status();
+
+    // Remove unit file
+    if PathBuf::from(SYSTEMD_UNIT_PATH).exists() {
+        std::fs::remove_file(SYSTEMD_UNIT_PATH)
+            .with_context(|| format!("failed to remove {}", SYSTEMD_UNIT_PATH))?;
+        println!("  removed {}", SYSTEMD_UNIT_PATH);
+    }
+
+    // Reload systemd
+    let _ = std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .status();
+
+    println!("\nvtether removed.");
     Ok(())
 }
 
