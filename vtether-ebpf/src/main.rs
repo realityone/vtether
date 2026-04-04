@@ -74,8 +74,19 @@ pub struct ConntrackKey {
     pub _pad: [u8; 3],
 }
 
-// tcp_fin_state tracks FIN flags seen for TCP connection teardown:
-//   0 = OPEN, 1 = FIN from one side, 2 = FIN from both sides (ready to delete)
+// tcp_state is a bitfield tracking TCP connection lifecycle:
+//   bit 0 (0x01): ESTABLISHED — seen return traffic
+//   bit 1 (0x02): FIN from client (forward path)
+//   bit 2 (0x04): FIN from server (return path)
+// Reaper timeouts based on state:
+//   0x00 (SYN_SENT)            → 120s
+//   0x01 (ESTABLISHED)         → 432000s (5 days)
+//   0x03 or 0x05 (FIN_WAIT)   → 120s
+//   0x07 (CLOSE)               → 10s
+pub const TCP_STATE_ESTABLISHED: u8 = 0x01;
+pub const TCP_STATE_FIN_CLIENT: u8 = 0x02;
+pub const TCP_STATE_FIN_SERVER: u8 = 0x04;
+
 #[repr(C)]
 pub struct ConntrackValue {
     pub snat_ip: u32,
@@ -84,7 +95,7 @@ pub struct ConntrackValue {
     pub orig_dst_port: u16,
     pub new_dst_port: u16,
     pub snat_port: u16,
-    pub tcp_fin_state: u8,
+    pub tcp_state: u8,
     pub _pad: u8,
 }
 
@@ -431,7 +442,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
                 orig_dst_port: dst_port,
                 new_dst_port: new_dst_port_ne,
                 snat_port: port,
-                tcp_fin_state: 0,
+                tcp_state: 0,
                 _pad: 0,
             };
             if CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0).is_err() {
@@ -501,13 +512,12 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
                 let should_remove = if flags & TCP_RST != 0 {
                     true
                 } else if flags & TCP_FIN != 0 {
-                    // Track FIN from client (forward path).
-                    // Bump fin_state: 0→1 (first FIN), 1→2 (both FINs seen).
+                    // Set FIN_CLIENT bit in forward path
                     if let Some(entry) = CONNTRACK_OUT.get_ptr_mut(&fwd_key) {
-                        let state = unsafe { (*entry).tcp_fin_state };
-                        let new_state = state.saturating_add(1);
-                        unsafe { (*entry).tcp_fin_state = new_state };
-                        new_state >= 2
+                        let state = unsafe { (*entry).tcp_state } | TCP_STATE_FIN_CLIENT;
+                        unsafe { (*entry).tcp_state = state };
+                        state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
+                            == (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
                     } else {
                         false
                     }
@@ -574,7 +584,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             dst_port, client_port,
         )?;
 
-        // Update last_seen timestamp on forward conntrack entry
+        // Update last_seen timestamp and mark as ESTABLISHED on forward conntrack entry
         let ret_fwd_key = ConntrackKey {
             client_ip: new_dst_ip,
             client_port,
@@ -583,7 +593,10 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             _pad: [0; 3],
         };
         if let Some(fwd_entry) = CONNTRACK_OUT.get_ptr_mut(&ret_fwd_key) {
-            unsafe { (*fwd_entry).last_seen_ns = aya_ebpf::helpers::bpf_ktime_get_ns() };
+            unsafe {
+                (*fwd_entry).last_seen_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+                (*fwd_entry).tcp_state |= TCP_STATE_ESTABLISHED;
+            }
         }
 
         // Update per-route stats (use original service port for the route key)
@@ -610,12 +623,12 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
                 let should_remove = if flags & TCP_RST != 0 {
                     true
                 } else if flags & TCP_FIN != 0 {
-                    // Track FIN from server (return path).
+                    // Set FIN_SERVER bit in return path
                     if let Some(entry) = CONNTRACK_OUT.get_ptr_mut(&fwd_key) {
-                        let state = unsafe { (*entry).tcp_fin_state };
-                        let new_state = state.saturating_add(1);
-                        unsafe { (*entry).tcp_fin_state = new_state };
-                        new_state >= 2
+                        let state = unsafe { (*entry).tcp_state } | TCP_STATE_FIN_SERVER;
+                        unsafe { (*entry).tcp_state = state };
+                        state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
+                            == (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
                     } else {
                         false
                     }

@@ -21,10 +21,16 @@ const IPPROTO_UDP: u8 = 17;
 const REAP_INTERVAL_SECS: u64 = 120;
 
 // State-based timeouts matching Linux nf_conntrack patterns
+const TCP_TIMEOUT_SYN_SENT: u64 = 120;
 const TCP_TIMEOUT_ESTABLISHED: u64 = 432_000; // 5 days
 const TCP_TIMEOUT_FIN_WAIT: u64 = 120;
 const TCP_TIMEOUT_CLOSE: u64 = 10;
 const UDP_TIMEOUT: u64 = 180;
+
+// tcp_state bitfield (must match eBPF)
+const TCP_STATE_ESTABLISHED: u8 = 0x01;
+const TCP_STATE_FIN_CLIENT: u8 = 0x02;
+const TCP_STATE_FIN_SERVER: u8 = 0x04;
 
 // ---- CLI ----
 
@@ -151,7 +157,7 @@ struct ConntrackValue {
     orig_dst_port: u16,
     new_dst_port: u16,
     snat_port: u16,
-    tcp_fin_state: u8,
+    tcp_state: u8,
     _pad: u8,
 }
 
@@ -560,8 +566,8 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(REAP_INTERVAL_SECS));
         info!(
-            "conntrack reaper started (interval: {}s, timeouts: tcp_est={}s tcp_fin={}s tcp_close={}s udp={}s)",
-            REAP_INTERVAL_SECS, TCP_TIMEOUT_ESTABLISHED, TCP_TIMEOUT_FIN_WAIT, TCP_TIMEOUT_CLOSE, UDP_TIMEOUT,
+            "conntrack reaper started (interval: {}s, timeouts: syn_sent={}s established={}s fin_wait={}s close={}s udp={}s)",
+            REAP_INTERVAL_SECS, TCP_TIMEOUT_SYN_SENT, TCP_TIMEOUT_ESTABLISHED, TCP_TIMEOUT_FIN_WAIT, TCP_TIMEOUT_CLOSE, UDP_TIMEOUT,
         );
         loop {
             interval.tick().await;
@@ -601,12 +607,16 @@ fn ktime_get_ns() -> u64 {
 }
 
 /// Return the timeout in nanoseconds for a conntrack entry based on protocol and TCP state.
-fn conntrack_timeout_ns(protocol: u8, tcp_fin_state: u8) -> u64 {
+fn conntrack_timeout_ns(protocol: u8, tcp_state: u8) -> u64 {
     let secs = if protocol == IPPROTO_TCP {
-        match tcp_fin_state {
-            0 => TCP_TIMEOUT_ESTABLISHED,
-            1 => TCP_TIMEOUT_FIN_WAIT,
-            _ => TCP_TIMEOUT_CLOSE,
+        let has_established = tcp_state & TCP_STATE_ESTABLISHED != 0;
+        let has_fin_client = tcp_state & TCP_STATE_FIN_CLIENT != 0;
+        let has_fin_server = tcp_state & TCP_STATE_FIN_SERVER != 0;
+        match (has_established, has_fin_client, has_fin_server) {
+            (false, _, _) => TCP_TIMEOUT_SYN_SENT,
+            (true, false, false) => TCP_TIMEOUT_ESTABLISHED,
+            (true, true, true) => TCP_TIMEOUT_CLOSE,
+            (true, _, _) => TCP_TIMEOUT_FIN_WAIT,
         }
     } else {
         UDP_TIMEOUT
@@ -614,12 +624,16 @@ fn conntrack_timeout_ns(protocol: u8, tcp_fin_state: u8) -> u64 {
     secs * 1_000_000_000
 }
 
-fn conntrack_state_name(protocol: u8, tcp_fin_state: u8) -> &'static str {
+fn conntrack_state_name(protocol: u8, tcp_state: u8) -> &'static str {
     if protocol == IPPROTO_TCP {
-        match tcp_fin_state {
-            0 => "ESTABLISHED",
-            1 => "FIN_WAIT",
-            _ => "CLOSE",
+        let has_established = tcp_state & TCP_STATE_ESTABLISHED != 0;
+        let has_fin_client = tcp_state & TCP_STATE_FIN_CLIENT != 0;
+        let has_fin_server = tcp_state & TCP_STATE_FIN_SERVER != 0;
+        match (has_established, has_fin_client, has_fin_server) {
+            (false, _, _) => "SYN_SENT",
+            (true, false, false) => "ESTABLISHED",
+            (true, true, true) => "CLOSE",
+            (true, _, _) => "FIN_WAIT",
         }
     } else {
         "ACTIVE"
@@ -651,7 +665,7 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<()> {
     let mut stale: Vec<(ConntrackKey, ConntrackValue)> = Vec::new();
     for item in conntrack_out.iter() {
         if let Ok((key, val)) = item {
-            let timeout = conntrack_timeout_ns(key.protocol, val.tcp_fin_state);
+            let timeout = conntrack_timeout_ns(key.protocol, val.tcp_state);
             if now.saturating_sub(val.last_seen_ns) > timeout {
                 stale.push((key, val));
             }
@@ -674,7 +688,7 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<()> {
             client_ip,
             client_port,
             svc_port,
-            conntrack_state_name(key.protocol, val.tcp_fin_state),
+            conntrack_state_name(key.protocol, val.tcp_state),
             idle_secs,
         );
 
