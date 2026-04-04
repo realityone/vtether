@@ -1,6 +1,27 @@
+[workspace]
+members = ["vtether-ebpf"]
+default-members = ["."]
+
 [package]
 name = "vtether"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aya = "0.13"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[build-dependencies]
+aya-build = "0.1"
+
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+
+[profile.release]
+lto = true

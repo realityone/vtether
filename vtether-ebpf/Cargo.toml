@@ -1,0 +1,12 @@
+[package]
+name = "vtether-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vtether-forward"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
