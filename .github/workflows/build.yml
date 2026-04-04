@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            linker: gcc-aarch64-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --component rust-src
+          rustup default nightly
+          rustup target add ${{ matrix.target }}
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Install cross-compilation linker
+        if: matrix.linker
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.linker }}
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtether-linux-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/vtether
