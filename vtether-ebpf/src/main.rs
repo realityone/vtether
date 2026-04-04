@@ -80,6 +80,7 @@ pub struct ConntrackKey {
 pub struct ConntrackValue {
     pub snat_ip: u32,
     pub dst_ip: u32,
+    pub last_seen_ns: u64,
     pub orig_dst_port: u16,
     pub new_dst_port: u16,
     pub snat_port: u16,
@@ -409,9 +410,12 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             _pad: [0; 3],
         };
 
-        let (snat_port, new_conn) = if let Some(existing) = unsafe { CONNTRACK_OUT.get(&fwd_key) }
+        let (snat_port, new_conn) = if let Some(existing) = CONNTRACK_OUT.get_ptr_mut(&fwd_key)
         {
-            (existing.snat_port, false)
+            // Update last_seen timestamp for existing connection
+            let snat_port = unsafe { (*existing).snat_port };
+            unsafe { (*existing).last_seen_ns = aya_ebpf::helpers::bpf_ktime_get_ns() };
+            (snat_port, false)
         } else {
             // New connection — allocate a unique SNAT source port.
             let port =
@@ -419,9 +423,11 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
 
             // Insert conntrack entries before rewriting the packet. If the map is full,
             // drop the packet — it cannot be NATed without a return path.
+            let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
             let fwd_val = ConntrackValue {
                 snat_ip: config.snat_ip,
                 dst_ip: config.dst_ip,
+                last_seen_ns: now,
                 orig_dst_port: dst_port,
                 new_dst_port: new_dst_port_ne,
                 snat_port: port,
@@ -567,6 +573,18 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             src_port, orig_svc_port,
             dst_port, client_port,
         )?;
+
+        // Update last_seen timestamp on forward conntrack entry
+        let ret_fwd_key = ConntrackKey {
+            client_ip: new_dst_ip,
+            client_port,
+            svc_port: orig_svc_port,
+            protocol,
+            _pad: [0; 3],
+        };
+        if let Some(fwd_entry) = CONNTRACK_OUT.get_ptr_mut(&ret_fwd_key) {
+            unsafe { (*fwd_entry).last_seen_ns = aya_ebpf::helpers::bpf_ktime_get_ns() };
+        }
 
         // Update per-route stats (use original service port for the route key)
         let ret_nat_key = NatKey {

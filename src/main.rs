@@ -57,8 +57,8 @@ enum ProxyAction {
         #[arg(long, default_value = DEFAULT_PIN_PATH)]
         pin_path: PathBuf,
     },
-    /// Stop all proxy routes
-    Down {
+    /// Destroy proxy and clean up all resources
+    Destroy {
         /// bpffs pin path used during `proxy up`
         #[arg(long, default_value = DEFAULT_PIN_PATH)]
         pin_path: PathBuf,
@@ -76,12 +76,19 @@ struct Config {
     /// Max conntrack entries (default: 65536)
     #[serde(default = "default_conntrack_size")]
     conntrack_size: u32,
+    /// Conntrack idle timeout in seconds (default: 300)
+    #[serde(default = "default_conntrack_timeout")]
+    conntrack_timeout: u64,
     #[serde(default)]
     routes: Vec<RouteConfig>,
 }
 
 fn default_conntrack_size() -> u32 {
     65536
+}
+
+fn default_conntrack_timeout() -> u64 {
+    300
 }
 
 fn default_protocol() -> String {
@@ -136,6 +143,7 @@ unsafe impl aya::Pod for ConntrackKey {}
 struct ConntrackValue {
     snat_ip: u32,
     dst_ip: u32,
+    last_seen_ns: u64,
     orig_dst_port: u16,
     new_dst_port: u16,
     snat_port: u16,
@@ -144,6 +152,29 @@ struct ConntrackValue {
 }
 
 unsafe impl aya::Pod for ConntrackValue {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConntrackRevKey {
+    dst_ip: u32,
+    svc_port: u16,
+    snat_port: u16,
+    protocol: u8,
+    _pad: [u8; 3],
+}
+
+unsafe impl aya::Pod for ConntrackRevKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConntrackRevValue {
+    client_ip: u32,
+    snat_ip: u32,
+    orig_svc_port: u16,
+    client_port: u16,
+}
+
+unsafe impl aya::Pod for ConntrackRevValue {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -165,7 +196,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Proxy { action } => match action {
             ProxyAction::Up { config, pin_path } => proxy_up(config, pin_path),
-            ProxyAction::Down { pin_path } => proxy_down(pin_path),
+            ProxyAction::Destroy { pin_path } => proxy_destroy(pin_path),
         },
         Commands::Setup => setup(),
         Commands::Version => {
@@ -298,10 +329,9 @@ Description=vtether - eBPF/XDP port forwarder
 After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 ExecStart={bin} proxy up --config {config}
-ExecStop={bin} proxy down
+ExecStop={bin} proxy destroy
 
 [Install]
 WantedBy=multi-user.target
@@ -340,7 +370,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let prog_pin = pin_path.join("prog");
     anyhow::ensure!(
         !prog_pin.exists(),
-        "proxy already running (pin {} exists). Run `vtether proxy down` first.",
+        "proxy already running (pin {} exists). Run `vtether proxy destroy` first.",
         prog_pin.display()
     );
 
@@ -456,7 +486,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
             .pin(pin_path.join("link"))
             .context("failed to pin XDP link to bpffs")?;
 
-        // Save state for `proxy down` in a regular filesystem directory
+        // Save state for `proxy destroy` in a regular filesystem directory
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("failed to create state dir: {}", state_dir.display()))?;
         std::fs::write(state_dir.join("interface"), &config.interface)?;
@@ -482,19 +512,105 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         return Err(e.context("proxy up failed, cleaned up partial state"));
     }
 
+    info!(
+        "proxy up: xdp on {}, snat_ip: {}, conntrack: {}, timeout: {}s",
+        config.interface, snat_ip, config.conntrack_size, config.conntrack_timeout
+    );
     println!(
-        "vtether: proxy up (xdp on {}, snat_ip: {}, conntrack: {})",
-        config.interface, snat_ip, config.conntrack_size
+        "vtether: proxy up (xdp on {}, snat_ip: {}, conntrack: {}, timeout: {}s)",
+        config.interface, snat_ip, config.conntrack_size, config.conntrack_timeout
     );
     for (port, to, proto) in &parsed_routes {
         println!("  {} :{} -> {}", protocol_name(*proto), port, to);
         info!("route: {} :{} -> {}", protocol_name(*proto), port, to);
     }
 
+    // Block forever, running conntrack reaper every 2 minutes
+    let timeout_ns = config.conntrack_timeout * 1_000_000_000;
+    info!("starting conntrack reaper (interval: 120s, timeout: {}s)", config.conntrack_timeout);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        if let Err(e) = reap_conntrack(&pin_path, timeout_ns) {
+            log::warn!("conntrack reaper error: {:#}", e);
+        }
+    }
+}
+
+fn ktime_get_ns() -> u64 {
+    let ts = nix::time::ClockId::CLOCK_BOOTTIME
+        .now()
+        .expect("CLOCK_BOOTTIME");
+    ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
+}
+
+fn reap_conntrack(pin_path: &std::path::Path, timeout_ns: u64) -> anyhow::Result<()> {
+    let conntrack_out_path = pin_path.join("conntrack_out");
+    let conntrack_in_path = pin_path.join("conntrack_in");
+    if !conntrack_out_path.exists() || !conntrack_in_path.exists() {
+        return Ok(());
+    }
+
+    let map_data = MapData::from_pin(&conntrack_out_path)
+        .context("failed to load pinned CONNTRACK_OUT")?;
+    let map = Map::HashMap(map_data);
+    let mut conntrack_out: HashMap<_, ConntrackKey, ConntrackValue> =
+        HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
+
+    let map_data = MapData::from_pin(&conntrack_in_path)
+        .context("failed to load pinned CONNTRACK_IN")?;
+    let map = Map::HashMap(map_data);
+    let mut conntrack_in: HashMap<_, ConntrackRevKey, ConntrackRevValue> =
+        HashMap::try_from(map).context("failed to parse CONNTRACK_IN map")?;
+
+    let now = ktime_get_ns();
+
+    // Collect stale entries (can't remove while iterating)
+    let mut stale: Vec<(ConntrackKey, ConntrackValue)> = Vec::new();
+    for item in conntrack_out.iter() {
+        if let Ok((key, val)) = item {
+            if now.saturating_sub(val.last_seen_ns) > timeout_ns {
+                stale.push((key, val));
+            }
+        }
+    }
+
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    info!("reaper: removing {} stale conntrack entries", stale.len());
+    for (key, val) in &stale {
+        let client_ip = Ipv4Addr::from(u32::from_be(key.client_ip));
+        let client_port = u16::from_be(key.client_port);
+        let svc_port = u16::from_be(key.svc_port);
+        let idle_secs = now.saturating_sub(val.last_seen_ns) / 1_000_000_000;
+        info!(
+            "reaper: {} {}:{} -> :{} (idle {}s, fin_state={})",
+            protocol_name(key.protocol),
+            client_ip,
+            client_port,
+            svc_port,
+            idle_secs,
+            val.tcp_fin_state,
+        );
+
+        let _ = conntrack_out.remove(key);
+
+        // Remove corresponding reverse entry
+        let rev_key = ConntrackRevKey {
+            dst_ip: val.dst_ip,
+            svc_port: val.new_dst_port,
+            snat_port: val.snat_port,
+            protocol: key.protocol,
+            _pad: [0; 3],
+        };
+        let _ = conntrack_in.remove(&rev_key);
+    }
+
     Ok(())
 }
 
-fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
+fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
     let prog_pin = pin_path.join("prog");
     anyhow::ensure!(
         prog_pin.exists(),
@@ -528,7 +644,7 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
     let _ = std::fs::remove_dir(&pin_path);
     let _ = std::fs::remove_dir_all(&state_dir);
 
-    println!("vtether: proxy down (detached from {})", interface.trim());
+    println!("vtether: proxy destroy (detached from {})", interface.trim());
 
     Ok(())
 }
