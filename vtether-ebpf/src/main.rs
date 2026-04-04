@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::{map, xdp},
-    maps::{HashMap, PerCpuArray, PerCpuHashMap},
+    maps::{HashMap, PerCpuHashMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -106,6 +106,7 @@ pub struct RouteStats {
     pub connections: u64,
     pub packets: u64,
     pub bytes: u64,
+    pub drops: u64,
 }
 
 // ---- Maps ----
@@ -115,11 +116,6 @@ static NAT_CONFIG: HashMap<NatKey, NatConfigEntry> = HashMap::with_max_entries(1
 
 #[map]
 static ROUTE_STATS: PerCpuHashMap<NatKey, RouteStats> = PerCpuHashMap::with_max_entries(128, 0);
-
-// Per-CPU drop counter — index 0 holds the number of packets dropped due to
-// conntrack map being full. Aggregated across CPUs in userspace.
-#[map]
-static DROP_COUNTER: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 // Conntrack maps use HashMap (not LruHashMap) so active connections are never silently
 // evicted. When the map is full, new connections fail gracefully (packet passed without
@@ -185,10 +181,19 @@ fn write_field<T>(ptr: *mut T, val: T) {
     unsafe { core::ptr::write_unaligned(ptr, val) };
 }
 
+/// Increment per-route drop counter when conntrack is full.
 #[inline(always)]
-fn increment_drop_counter() {
-    if let Some(cnt) = DROP_COUNTER.get_ptr_mut(0) {
-        unsafe { *cnt += 1 };
+fn update_route_drops(nat_key: &NatKey) {
+    if let Some(stats) = ROUTE_STATS.get_ptr_mut(nat_key) {
+        unsafe { (*stats).drops += 1 };
+    } else {
+        let stats = RouteStats {
+            connections: 0,
+            packets: 0,
+            bytes: 0,
+            drops: 1,
+        };
+        let _ = ROUTE_STATS.insert(nat_key, &stats, 0);
     }
 }
 
@@ -208,6 +213,7 @@ fn update_route_stats(nat_key: &NatKey, pkt_len: u64, new_conn: bool) {
             connections: if new_conn { 1 } else { 0 },
             packets: 1,
             bytes: pkt_len,
+            drops: 0,
         };
         let _ = ROUTE_STATS.insert(nat_key, &stats, 0);
     }
@@ -419,7 +425,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
                 _pad: 0,
             };
             if CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0).is_err() {
-                increment_drop_counter();
+                update_route_drops(&nat_key);
                 return Ok(aya_ebpf::bindings::xdp_action::XDP_DROP);
             }
 
@@ -438,7 +444,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             };
             if CONNTRACK_IN.insert(&rev_key, &rev_val, 0).is_err() {
                 let _ = CONNTRACK_OUT.remove(&fwd_key);
-                increment_drop_counter();
+                update_route_drops(&nat_key);
                 return Ok(aya_ebpf::bindings::xdp_action::XDP_DROP);
             }
 

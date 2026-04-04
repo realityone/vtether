@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use aya::maps::{HashMap, Map, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues};
+use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
@@ -150,6 +150,7 @@ struct RouteStats {
     connections: u64,
     packets: u64,
     bytes: u64,
+    drops: u64,
 }
 
 unsafe impl aya::Pod for RouteStats {}
@@ -421,7 +422,6 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         ("CONNTRACK_OUT", "conntrack_out"),
         ("CONNTRACK_IN", "conntrack_in"),
         ("ROUTE_STATS", "route_stats"),
-        ("DROP_COUNTER", "drop_counter"),
     ] {
         if let Some(map) = ebpf.map(name) {
             map.pin(pin_path.join(pin_name))
@@ -473,7 +473,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
             .status();
         let _ = std::fs::remove_file(&prog_pin);
         let _ = std::fs::remove_file(pin_path.join("link"));
-        for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats", "drop_counter"] {
+        for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
             let _ = std::fs::remove_file(pin_path.join(pin_name));
         }
         let _ = std::fs::remove_dir(&pin_path);
@@ -521,7 +521,7 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
 
     // Unpin program, maps, and clean up
     let _ = std::fs::remove_file(&prog_pin);
-    for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats", "drop_counter"] {
+    for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
         let _ = std::fs::remove_file(pin_path.join(pin_name));
     }
     let _ = std::fs::remove_dir(&pin_path);
@@ -587,12 +587,16 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
                 snat_ip,
             );
             if let Some(s) = stats {
-                println!(
+                print!(
                     "    connections: {}  packets: {}  bytes: {}",
                     s.connections,
                     s.packets,
                     format_bytes(s.bytes),
                 );
+                if s.drops > 0 {
+                    print!("  drops: {}", s.drops);
+                }
+                println!();
             }
         }
     }
@@ -615,23 +619,6 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
         println!("\nActive connections: {}", count);
     }
 
-    // Read drop counter
-    let drop_counter_path = pin_path.join("drop_counter");
-    if drop_counter_path.exists() {
-        let map_data = MapData::from_pin(&drop_counter_path)
-            .context("failed to load pinned DROP_COUNTER")?;
-        let map = Map::PerCpuArray(map_data);
-        let drop_counter: PerCpuArray<_, u64> =
-            PerCpuArray::try_from(map).context("failed to parse DROP_COUNTER map")?;
-
-        if let Ok(per_cpu) = drop_counter.get(&0, 0) {
-            let total: u64 = per_cpu.iter().sum();
-            if total > 0 {
-                println!("Dropped (conntrack full): {}", total);
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -640,11 +627,13 @@ fn aggregate_stats(per_cpu: PerCpuValues<RouteStats>) -> RouteStats {
         connections: 0,
         packets: 0,
         bytes: 0,
+        drops: 0,
     };
     for s in per_cpu.iter() {
         total.connections += s.connections;
         total.packets += s.packets;
         total.bytes += s.bytes;
+        total.drops += s.drops;
     }
     total
 }
