@@ -169,17 +169,11 @@ fn state_dir_for(pin_path: &std::path::Path) -> PathBuf {
 }
 
 fn print_version() {
-    let version = env!("CARGO_PKG_VERSION");
-    let commit = env!("VT_COMMIT");
-    let dirty: bool = env!("VT_DIRTY").parse().unwrap_or(false);
-    let build_date = env!("VT_BUILD_DATE");
-
-    let version_suffix = if dirty { "-dev" } else { "" };
-    let commit_suffix = if dirty { "-dirty" } else { "" };
-
     println!(
-        "vtether {}{} (commit {}{}, built {})",
-        version, version_suffix, commit, commit_suffix, build_date
+        "vtether {} (commit {}, built {})",
+        env!("VT_VERSION"),
+        env!("VT_COMMIT"),
+        env!("VT_BUILD_DATE"),
     );
 }
 
