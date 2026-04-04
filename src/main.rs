@@ -139,7 +139,8 @@ struct ConntrackValue {
     orig_dst_port: u16,
     new_dst_port: u16,
     snat_port: u16,
-    _pad: u16,
+    tcp_fin_state: u8,
+    _pad: u8,
 }
 
 unsafe impl aya::Pod for ConntrackValue {}

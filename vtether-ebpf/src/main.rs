@@ -20,6 +20,7 @@ const ETH_HDR_LEN: usize = 14;
 const TCP_CSUM_OFF: usize = 16;
 // TCP flags offset within TCP header (byte containing FIN/SYN/RST/ACK)
 const TCP_FLAGS_OFF: usize = 13;
+const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 // UDP checksum offset within UDP header
 const UDP_CSUM_OFF: usize = 6;
@@ -73,6 +74,8 @@ pub struct ConntrackKey {
     pub _pad: [u8; 3],
 }
 
+// tcp_fin_state tracks FIN flags seen for TCP connection teardown:
+//   0 = OPEN, 1 = FIN from one side, 2 = FIN from both sides (ready to delete)
 #[repr(C)]
 pub struct ConntrackValue {
     pub snat_ip: u32,
@@ -80,7 +83,8 @@ pub struct ConntrackValue {
     pub orig_dst_port: u16,
     pub new_dst_port: u16,
     pub snat_port: u16,
-    pub _pad: u16,
+    pub tcp_fin_state: u8,
+    pub _pad: u8,
 }
 
 #[repr(C)]
@@ -421,6 +425,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
                 orig_dst_port: dst_port,
                 new_dst_port: new_dst_port_ne,
                 snat_port: port,
+                tcp_fin_state: 0,
                 _pad: 0,
             };
             if CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0).is_err() {
@@ -483,12 +488,27 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
         update_route_stats(&nat_key, pkt_len, new_conn);
 
-        // Clean up conntrack on TCP RST (abrupt close only; FIN goes through
-        // the normal 4-way handshake so we must keep conntrack alive for it)
+        // Clean up conntrack on TCP RST or after both FINs seen
         if protocol == IPPROTO_TCP {
             if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
                 let flags = read_field(flags_ptr as *const u8);
-                if flags & TCP_RST != 0 {
+                let should_remove = if flags & TCP_RST != 0 {
+                    true
+                } else if flags & TCP_FIN != 0 {
+                    // Track FIN from client (forward path).
+                    // Bump fin_state: 0→1 (first FIN), 1→2 (both FINs seen).
+                    if let Some(entry) = CONNTRACK_OUT.get_ptr_mut(&fwd_key) {
+                        let state = unsafe { (*entry).tcp_fin_state };
+                        let new_state = state.saturating_add(1);
+                        unsafe { (*entry).tcp_fin_state = new_state };
+                        new_state >= 2
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_remove {
                     let _ = CONNTRACK_OUT.remove(&fwd_key);
                     let rev_key = ConntrackRevKey {
                         dst_ip: new_dst_ip,
@@ -557,20 +577,34 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
         update_route_stats(&ret_nat_key, pkt_len, false);
 
-        // Clean up conntrack on TCP RST (abrupt close only; FIN goes through
-        // the normal 4-way handshake so we must keep conntrack alive for it)
+        // Clean up conntrack on TCP RST or after both FINs seen
         if protocol == IPPROTO_TCP {
             if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
                 let flags = read_field(flags_ptr as *const u8);
-                if flags & TCP_RST != 0 {
-                    // Reconstruct forward key from reverse conntrack entry
-                    let fwd_key = ConntrackKey {
-                        client_ip: new_dst_ip,
-                        client_port,
-                        svc_port: orig_svc_port,
-                        protocol,
-                        _pad: [0; 3],
-                    };
+                // Reconstruct forward key from reverse conntrack entry
+                let fwd_key = ConntrackKey {
+                    client_ip: new_dst_ip,
+                    client_port,
+                    svc_port: orig_svc_port,
+                    protocol,
+                    _pad: [0; 3],
+                };
+                let should_remove = if flags & TCP_RST != 0 {
+                    true
+                } else if flags & TCP_FIN != 0 {
+                    // Track FIN from server (return path).
+                    if let Some(entry) = CONNTRACK_OUT.get_ptr_mut(&fwd_key) {
+                        let state = unsafe { (*entry).tcp_fin_state };
+                        let new_state = state.saturating_add(1);
+                        unsafe { (*entry).tcp_fin_state = new_state };
+                        new_state >= 2
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_remove {
                     let _ = CONNTRACK_OUT.remove(&fwd_key);
                     let _ = CONNTRACK_IN.remove(&rev_key);
                 }
