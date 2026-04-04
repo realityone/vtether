@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
+use aya::maps::{HashMap, Map, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
@@ -73,8 +73,15 @@ struct Config {
     interface: String,
     /// IP address used as source in SNAT (auto-detected from interface if omitted)
     snat_ip: Option<String>,
+    /// Max conntrack entries (default: 65536)
+    #[serde(default = "default_conntrack_size")]
+    conntrack_size: u32,
     #[serde(default)]
     routes: Vec<RouteConfig>,
+}
+
+fn default_conntrack_size() -> u32 {
+    65536
 }
 
 fn default_protocol() -> String {
@@ -374,11 +381,14 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         );
     }
 
-    // Load eBPF
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/vtether-forward"
-    )))
+    // Load eBPF with configurable conntrack map size
+    let mut ebpf = aya::EbpfLoader::new()
+        .set_max_entries("CONNTRACK_OUT", config.conntrack_size)
+        .set_max_entries("CONNTRACK_IN", config.conntrack_size)
+        .load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/vtether-forward"
+        )))
     .context("failed to load eBPF bytecode")?;
 
     // Populate NAT_CONFIG map
@@ -411,6 +421,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         ("CONNTRACK_OUT", "conntrack_out"),
         ("CONNTRACK_IN", "conntrack_in"),
         ("ROUTE_STATS", "route_stats"),
+        ("DROP_COUNTER", "drop_counter"),
     ] {
         if let Some(map) = ebpf.map(name) {
             map.pin(pin_path.join(pin_name))
@@ -462,7 +473,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
             .status();
         let _ = std::fs::remove_file(&prog_pin);
         let _ = std::fs::remove_file(pin_path.join("link"));
-        for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
+        for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats", "drop_counter"] {
             let _ = std::fs::remove_file(pin_path.join(pin_name));
         }
         let _ = std::fs::remove_dir(&pin_path);
@@ -470,7 +481,10 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         return Err(e.context("proxy up failed, cleaned up partial state"));
     }
 
-    println!("vtether: proxy up (xdp on {}, snat_ip: {})", config.interface, snat_ip);
+    println!(
+        "vtether: proxy up (xdp on {}, snat_ip: {}, conntrack: {})",
+        config.interface, snat_ip, config.conntrack_size
+    );
     for (port, to, proto) in &parsed_routes {
         println!("  {} :{} -> {}", protocol_name(*proto), port, to);
         info!("route: {} :{} -> {}", protocol_name(*proto), port, to);
@@ -507,7 +521,7 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
 
     // Unpin program, maps, and clean up
     let _ = std::fs::remove_file(&prog_pin);
-    for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
+    for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats", "drop_counter"] {
         let _ = std::fs::remove_file(pin_path.join(pin_name));
     }
     let _ = std::fs::remove_dir(&pin_path);
@@ -599,6 +613,23 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
             }
         }
         println!("\nActive connections: {}", count);
+    }
+
+    // Read drop counter
+    let drop_counter_path = pin_path.join("drop_counter");
+    if drop_counter_path.exists() {
+        let map_data = MapData::from_pin(&drop_counter_path)
+            .context("failed to load pinned DROP_COUNTER")?;
+        let map = Map::PerCpuArray(map_data);
+        let drop_counter: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(map).context("failed to parse DROP_COUNTER map")?;
+
+        if let Ok(per_cpu) = drop_counter.get(&0, 0) {
+            let total: u64 = per_cpu.iter().sum();
+            if total > 0 {
+                println!("Dropped (conntrack full): {}", total);
+            }
+        }
     }
 
     Ok(())
