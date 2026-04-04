@@ -18,6 +18,10 @@ const ETH_HDR_LEN: usize = 14;
 
 // TCP checksum offset within TCP header
 const TCP_CSUM_OFF: usize = 16;
+// TCP flags offset within TCP header (byte containing FIN/SYN/RST/ACK)
+const TCP_FLAGS_OFF: usize = 13;
+const TCP_FIN: u8 = 0x01;
+const TCP_RST: u8 = 0x04;
 // UDP checksum offset within UDP header
 const UDP_CSUM_OFF: usize = 6;
 
@@ -407,6 +411,17 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         };
         let _ = CONNTRACK_IN.insert(&rev_key, &rev_val, 0);
 
+        // Clean up conntrack on TCP FIN/RST
+        if protocol == IPPROTO_TCP {
+            if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
+                let flags = read_field(flags_ptr as *const u8);
+                if flags & (TCP_FIN | TCP_RST) != 0 {
+                    let _ = CONNTRACK_OUT.remove(&fwd_key);
+                    let _ = CONNTRACK_IN.remove(&rev_key);
+                }
+            }
+        }
+
         return Ok(pass);
     }
 
@@ -452,6 +467,25 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             src_port, orig_svc_port,
             dst_port, client_port,
         )?;
+
+        // Clean up conntrack on TCP FIN/RST
+        if protocol == IPPROTO_TCP {
+            if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
+                let flags = read_field(flags_ptr as *const u8);
+                if flags & (TCP_FIN | TCP_RST) != 0 {
+                    // Reconstruct forward key from reverse conntrack entry
+                    let fwd_key = ConntrackKey {
+                        client_ip: new_dst_ip,
+                        client_port,
+                        svc_port: orig_svc_port,
+                        protocol,
+                        _pad: [0; 3],
+                    };
+                    let _ = CONNTRACK_OUT.remove(&fwd_key);
+                    let _ = CONNTRACK_IN.remove(&rev_key);
+                }
+            }
+        }
 
         return Ok(pass);
     }
