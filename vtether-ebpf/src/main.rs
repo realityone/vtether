@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::{map, xdp},
-    maps::{HashMap, LruHashMap},
+    maps::{HashMap, LruHashMap, PerCpuHashMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -101,11 +101,27 @@ pub struct ConntrackRevValue {
     pub client_port: u16,
 }
 
+#[repr(C)]
+pub struct RouteStats {
+    pub connections: u64,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
 // ---- Maps ----
 
 #[map]
 static NAT_CONFIG: HashMap<NatKey, NatConfigEntry> = HashMap::with_max_entries(128, 0);
 
+#[map]
+static ROUTE_STATS: PerCpuHashMap<NatKey, RouteStats> = PerCpuHashMap::with_max_entries(128, 0);
+
+// Conntrack maps use a get-then-insert pattern that is not atomic across operations.
+// This is safe in practice because RSS/RPS steers packets of the same flow (same
+// src/dst IP + port tuple) to the same CPU, so concurrent access to the same entry
+// does not occur under normal conditions. See: https://docs.kernel.org/networking/scaling.html
+// In the rare case of a race (e.g. NIC without RSS), the worst outcome is an orphaned
+// LRU entry from a lost SNAT port allocation — no corruption or incorrect forwarding.
 #[map]
 static CONNTRACK_OUT: LruHashMap<ConntrackKey, ConntrackValue> =
     LruHashMap::with_max_entries(65536, 0);
@@ -158,6 +174,27 @@ fn read_field<T: Copy>(ptr: *const T) -> T {
 #[inline(always)]
 fn write_field<T>(ptr: *mut T, val: T) {
     unsafe { core::ptr::write_unaligned(ptr, val) };
+}
+
+/// Increment per-route packet/byte counters. On first packet of a new connection, also bump connections.
+#[inline(always)]
+fn update_route_stats(nat_key: &NatKey, pkt_len: u64, new_conn: bool) {
+    if let Some(stats) = ROUTE_STATS.get_ptr_mut(nat_key) {
+        unsafe {
+            (*stats).packets += 1;
+            (*stats).bytes += pkt_len;
+            if new_conn {
+                (*stats).connections += 1;
+            }
+        }
+    } else {
+        let stats = RouteStats {
+            connections: if new_conn { 1 } else { 0 },
+            packets: 1,
+            bytes: pkt_len,
+        };
+        let _ = ROUTE_STATS.insert(nat_key, &stats, 0);
+    }
 }
 
 // ---- XDP program ----
@@ -347,12 +384,15 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             _pad: [0; 3],
         };
 
-        let snat_port = if let Some(existing) = unsafe { CONNTRACK_OUT.get(&fwd_key) } {
-            existing.snat_port
+        let (snat_port, new_conn) = if let Some(existing) = unsafe { CONNTRACK_OUT.get(&fwd_key) }
+        {
+            (existing.snat_port, false)
         } else {
             // New connection — allocate a unique SNAT source port.
             // Try client's original port first; on collision, probe ephemeral range.
-            allocate_snat_port(src_ip, src_port, new_dst_ip, new_dst_port_ne, protocol)?
+            let port =
+                allocate_snat_port(src_ip, src_port, new_dst_ip, new_dst_port_ne, protocol)?;
+            (port, true)
         };
 
         // DNAT + SNAT (IP addresses)
@@ -411,6 +451,10 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         };
         let _ = CONNTRACK_IN.insert(&rev_key, &rev_val, 0);
 
+        // Update per-route stats
+        let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
+        update_route_stats(&nat_key, pkt_len, new_conn);
+
         // Clean up conntrack on TCP FIN/RST
         if protocol == IPPROTO_TCP {
             if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
@@ -467,6 +511,15 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             src_port, orig_svc_port,
             dst_port, client_port,
         )?;
+
+        // Update per-route stats (use original service port for the route key)
+        let ret_nat_key = NatKey {
+            port: u16::from_be(orig_svc_port),
+            protocol,
+            _pad: 0,
+        };
+        let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
+        update_route_stats(&ret_nat_key, pkt_len, false);
 
         // Clean up conntrack on TCP FIN/RST
         if protocol == IPPROTO_TCP {

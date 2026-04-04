@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use aya::maps::{HashMap, Map, MapData};
+use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
@@ -136,6 +136,16 @@ struct ConntrackValue {
 }
 
 unsafe impl aya::Pod for ConntrackValue {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteStats {
+    connections: u64,
+    packets: u64,
+    bytes: u64,
+}
+
+unsafe impl aya::Pod for RouteStats {}
 
 // ---- Main ----
 
@@ -400,6 +410,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         ("NAT_CONFIG", "nat_config"),
         ("CONNTRACK_OUT", "conntrack_out"),
         ("CONNTRACK_IN", "conntrack_in"),
+        ("ROUTE_STATS", "route_stats"),
     ] {
         if let Some(map) = ebpf.map(name) {
             map.pin(pin_path.join(pin_name))
@@ -451,7 +462,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
             .status();
         let _ = std::fs::remove_file(&prog_pin);
         let _ = std::fs::remove_file(pin_path.join("link"));
-        for pin_name in ["nat_config", "conntrack_out", "conntrack_in"] {
+        for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
             let _ = std::fs::remove_file(pin_path.join(pin_name));
         }
         let _ = std::fs::remove_dir(&pin_path);
@@ -496,7 +507,7 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
 
     // Unpin program, maps, and clean up
     let _ = std::fs::remove_file(&prog_pin);
-    for pin_name in ["nat_config", "conntrack_out", "conntrack_in"] {
+    for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
         let _ = std::fs::remove_file(pin_path.join(pin_name));
     }
     let _ = std::fs::remove_dir(&pin_path);
@@ -520,7 +531,18 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(|_| "unknown".to_string());
     println!("vtether: attached to {}", interface.trim());
 
-    // Read NAT_CONFIG map — show configured routes
+    // Load route stats map (per-CPU)
+    let stats_map = pin_path.join("route_stats");
+    let route_stats: Option<PerCpuHashMap<_, NatKey, RouteStats>> = if stats_map.exists() {
+        let map_data =
+            MapData::from_pin(&stats_map).context("failed to load pinned ROUTE_STATS")?;
+        let map = Map::PerCpuHashMap(map_data);
+        Some(PerCpuHashMap::try_from(map).context("failed to parse ROUTE_STATS map")?)
+    } else {
+        None
+    };
+
+    // Read NAT_CONFIG map — show configured routes with stats
     let nat_config_path = pin_path.join("nat_config");
     if nat_config_path.exists() {
         let map_data =
@@ -535,6 +557,13 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
             let dst_ip = Ipv4Addr::from(u32::from_be(entry.dst_ip));
             let snat_ip = Ipv4Addr::from(u32::from_be(entry.snat_ip));
             let dst_port = u16::from_be(entry.dst_port);
+
+            // Look up stats for this route, aggregating across all CPUs
+            let stats = route_stats
+                .as_ref()
+                .and_then(|m| m.get(&key, 0).ok())
+                .map(aggregate_stats);
+
             println!(
                 "  {} :{} -> {}:{} (snat: {})",
                 protocol_name(key.protocol),
@@ -543,6 +572,14 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
                 dst_port,
                 snat_ip,
             );
+            if let Some(s) = stats {
+                println!(
+                    "    connections: {}  packets: {}  bytes: {}",
+                    s.connections,
+                    s.packets,
+                    format_bytes(s.bytes),
+                );
+            }
         }
     }
 
@@ -565,6 +602,38 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn aggregate_stats(per_cpu: PerCpuValues<RouteStats>) -> RouteStats {
+    let mut total = RouteStats {
+        connections: 0,
+        packets: 0,
+        bytes: 0,
+    };
+    for s in per_cpu.iter() {
+        total.connections += s.connections;
+        total.packets += s.packets;
+        total.bytes += s.bytes;
+    }
+    total
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 // ---- Kernel setup ----
