@@ -13,7 +13,13 @@ use core::ptr::{addr_of, addr_of_mut};
 
 const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
 const ETH_HDR_LEN: usize = 14;
+
+// TCP checksum offset within TCP header
+const TCP_CSUM_OFF: usize = 16;
+// UDP checksum offset within UDP header
+const UDP_CSUM_OFF: usize = 6;
 
 // ---- Packet headers ----
 
@@ -50,7 +56,22 @@ struct TcpHdr {
     urg_ptr: u16,
 }
 
-// ---- Map value types ----
+#[repr(C, packed)]
+struct UdpHdr {
+    src_port: u16,
+    dst_port: u16,
+    len: u16,
+    check: u16,
+}
+
+// ---- Map key/value types ----
+
+#[repr(C)]
+pub struct NatKey {
+    pub port: u16,
+    pub protocol: u8,
+    pub _pad: u8,
+}
 
 #[repr(C)]
 pub struct NatConfigEntry {
@@ -63,6 +84,8 @@ pub struct ConntrackKey {
     pub client_ip: u32,
     pub client_port: u16,
     pub svc_port: u16,
+    pub protocol: u8,
+    pub _pad: [u8; 3],
 }
 
 #[repr(C)]
@@ -76,6 +99,8 @@ pub struct ConntrackRevKey {
     pub dst_ip: u32,
     pub svc_port: u16,
     pub client_port: u16,
+    pub protocol: u8,
+    pub _pad: [u8; 3],
 }
 
 #[repr(C)]
@@ -87,7 +112,7 @@ pub struct ConntrackRevValue {
 // ---- Maps ----
 
 #[map]
-static NAT_CONFIG: HashMap<u16, NatConfigEntry> = HashMap::with_max_entries(64, 0);
+static NAT_CONFIG: HashMap<NatKey, NatConfigEntry> = HashMap::with_max_entries(128, 0);
 
 #[map]
 static CONNTRACK_OUT: LruHashMap<ConntrackKey, ConntrackValue> =
@@ -152,6 +177,32 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     Ok(ptr as *mut T)
 }
 
+/// Update the transport-layer (TCP or UDP) checksum after IP address rewrites.
+#[inline(always)]
+fn update_transport_csum(
+    ctx: &XdpContext,
+    transport_offset: usize,
+    protocol: u8,
+    old1: u32,
+    new1: u32,
+    old2: u32,
+    new2: u32,
+) -> Result<(), ()> {
+    if protocol == IPPROTO_TCP {
+        let ck: *mut u16 = ptr_at(ctx, transport_offset + TCP_CSUM_OFF)?;
+        csum_replace4(ck, old1, new1);
+        csum_replace4(ck, old2, new2);
+    } else {
+        // UDP: checksum of 0 means "not computed", don't touch it
+        let ck: *mut u16 = ptr_at(ctx, transport_offset + UDP_CSUM_OFF)?;
+        if read_field(ck as *const u16) != 0 {
+            csum_replace4(ck, old1, new1);
+            csum_replace4(ck, old2, new2);
+        }
+    }
+    Ok(())
+}
+
 fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     let pass = aya_ebpf::bindings::xdp_action::XDP_PASS;
 
@@ -165,7 +216,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     // --- Parse IPv4 ---
     let ip: *mut Ipv4Hdr = ptr_at(ctx, ETH_HDR_LEN)?;
     let protocol = read_field(unsafe { addr_of!((*ip).protocol) });
-    if protocol != IPPROTO_TCP {
+    if protocol != IPPROTO_TCP && protocol != IPPROTO_UDP {
         return Ok(pass);
     }
     let ver_ihl = read_field(unsafe { addr_of!((*ip).ver_ihl) });
@@ -175,17 +226,25 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(pass);
     }
 
-    // --- Parse TCP ---
-    let tcp: *mut TcpHdr = ptr_at(ctx, ETH_HDR_LEN + ip_hdr_len)?;
+    let transport_offset = ETH_HDR_LEN + ip_hdr_len;
+
+    // --- Read ports (same layout for TCP and UDP) ---
+    let src_port_ptr: *const u16 = ptr_at(ctx, transport_offset)?;
+    let dst_port_ptr: *const u16 = ptr_at(ctx, transport_offset + 2)?;
 
     let src_ip = read_field(unsafe { addr_of!((*ip).src_addr) });
     let dst_ip = read_field(unsafe { addr_of!((*ip).dst_addr) });
-    let src_port = read_field(unsafe { addr_of!((*tcp).src_port) });
-    let dst_port = read_field(unsafe { addr_of!((*tcp).dst_port) });
+    let src_port = read_field(src_port_ptr);
+    let dst_port = read_field(dst_port_ptr);
     let dst_port_host = u16::from_be(dst_port);
 
     // === FORWARD PATH: client -> THIS_MACHINE:svc_port ===
-    if let Some(config) = unsafe { NAT_CONFIG.get(&dst_port_host) } {
+    let nat_key = NatKey {
+        port: dst_port_host,
+        protocol,
+        _pad: 0,
+    };
+    if let Some(config) = unsafe { NAT_CONFIG.get(&nat_key) } {
         let new_dst = config.dst_ip;
         let new_src = config.this_ip;
 
@@ -198,16 +257,16 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         csum_replace4(ip_ck, dst_ip, new_dst);
         csum_replace4(ip_ck, src_ip, new_src);
 
-        // Update TCP checksum (pseudo-header includes IP addresses)
-        let tcp_ck = unsafe { addr_of_mut!((*tcp).check) };
-        csum_replace4(tcp_ck, dst_ip, new_dst);
-        csum_replace4(tcp_ck, src_ip, new_src);
+        // Update transport checksum
+        update_transport_csum(ctx, transport_offset, protocol, dst_ip, new_dst, src_ip, new_src)?;
 
         // Insert conntrack entries
         let fwd_key = ConntrackKey {
             client_ip: src_ip,
             client_port: src_port,
             svc_port: dst_port,
+            protocol,
+            _pad: [0; 3],
         };
         let fwd_val = ConntrackValue {
             this_ip: config.this_ip,
@@ -219,6 +278,8 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             dst_ip: config.dst_ip,
             svc_port: dst_port,
             client_port: src_port,
+            protocol,
+            _pad: [0; 3],
         };
         let rev_val = ConntrackRevValue {
             client_ip: src_ip,
@@ -234,6 +295,8 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         dst_ip: src_ip,
         svc_port: src_port,
         client_port: dst_port,
+        protocol,
+        _pad: [0; 3],
     };
     if let Some(rev) = unsafe { CONNTRACK_IN.get(&rev_key) } {
         let new_src = rev.this_ip;
@@ -248,9 +311,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         csum_replace4(ip_ck, src_ip, new_src);
         csum_replace4(ip_ck, dst_ip, new_dst);
 
-        let tcp_ck = unsafe { addr_of_mut!((*tcp).check) };
-        csum_replace4(tcp_ck, src_ip, new_src);
-        csum_replace4(tcp_ck, dst_ip, new_dst);
+        update_transport_csum(ctx, transport_offset, protocol, src_ip, new_src, dst_ip, new_dst)?;
 
         return Ok(pass);
     }

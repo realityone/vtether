@@ -12,10 +12,13 @@ use serde::Deserialize;
 const DEFAULT_PIN_PATH: &str = "/sys/fs/bpf/vtether";
 const STATE_DIR: &str = "/run/vtether";
 
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+
 // ---- CLI ----
 
 #[derive(Parser)]
-#[command(name = "vtether", about = "eBPF-based TCP port forwarder (XDP)")]
+#[command(name = "vtether", about = "eBPF-based TCP/UDP port forwarder (XDP)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -61,13 +64,29 @@ struct Config {
     routes: Vec<RouteConfig>,
 }
 
+fn default_protocol() -> String {
+    "tcp".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct RouteConfig {
+    #[serde(default = "default_protocol")]
+    protocol: String,
     from: String,
     to: String,
 }
 
-// ---- BPF map value (must match vtether-ebpf NatConfigEntry exactly) ----
+// ---- BPF map types (must match vtether-ebpf exactly) ----
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NatKey {
+    port: u16,
+    protocol: u8,
+    _pad: u8,
+}
+
+unsafe impl aya::Pod for NatKey {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -92,6 +111,22 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn parse_protocol(s: &str) -> anyhow::Result<u8> {
+    match s {
+        "tcp" => Ok(IPPROTO_TCP),
+        "udp" => Ok(IPPROTO_UDP),
+        other => anyhow::bail!("unsupported protocol '{}' (expected 'tcp' or 'udp')", other),
+    }
+}
+
+fn protocol_name(proto: u8) -> &'static str {
+    match proto {
+        IPPROTO_TCP => "tcp",
+        IPPROTO_UDP => "udp",
+        _ => "unknown",
+    }
+}
+
 fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {}", config_path.display()))?;
@@ -107,10 +142,12 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let this_ip_be = u32::from(this_ip).to_be();
 
     // Parse all routes upfront
-    let parsed_routes: Vec<(SocketAddrV4, SocketAddrV4)> = config
+    let parsed_routes: Vec<(SocketAddrV4, SocketAddrV4, u8)> = config
         .routes
         .iter()
         .map(|r| {
+            let proto = parse_protocol(&r.protocol)
+                .with_context(|| format!("in route {} -> {}", r.from, r.to))?;
             let from: SocketAddrV4 = r
                 .from
                 .parse()
@@ -119,16 +156,17 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
                 .to
                 .parse()
                 .with_context(|| format!("invalid 'to' address: {}", r.to))?;
-            Ok((from, to))
+            Ok((from, to, proto))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Check for duplicate source ports
-    let mut seen_ports = std::collections::HashSet::new();
-    for (from, _) in &parsed_routes {
+    // Check for duplicate (port, protocol) pairs
+    let mut seen = std::collections::HashSet::new();
+    for (from, _, proto) in &parsed_routes {
         anyhow::ensure!(
-            seen_ports.insert(from.port()),
-            "duplicate source port: {}",
+            seen.insert((from.port(), *proto)),
+            "duplicate route: {}/{}",
+            protocol_name(*proto),
             from.port()
         );
     }
@@ -149,15 +187,20 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     .context("failed to load eBPF bytecode")?;
 
     // Populate NAT_CONFIG map
-    let mut nat_config: HashMap<_, u16, NatConfigEntry> =
+    let mut nat_config: HashMap<_, NatKey, NatConfigEntry> =
         HashMap::try_from(ebpf.map_mut("NAT_CONFIG").context("NAT_CONFIG map not found")?)?;
 
-    for (from, to) in &parsed_routes {
+    for (from, to, proto) in &parsed_routes {
+        let key = NatKey {
+            port: from.port(),
+            protocol: *proto,
+            _pad: 0,
+        };
         let entry = NatConfigEntry {
             dst_ip: u32::from(*to.ip()).to_be(),
             this_ip: this_ip_be,
         };
-        nat_config.insert(from.port(), entry, 0)?;
+        nat_config.insert(key, entry, 0)?;
     }
 
     // Load and attach XDP program
@@ -195,9 +238,9 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     setup_sysctl(&config.interface);
 
     println!("vtether: proxy up (xdp on {}, this_ip: {})", config.interface, config.this_ip);
-    for (from, to) in &parsed_routes {
-        println!("  {} -> {}", from, to);
-        info!("route: {} -> {}", from, to);
+    for (from, to, proto) in &parsed_routes {
+        println!("  {} {} -> {}", protocol_name(*proto), from, to);
+        info!("route: {} {} -> {}", protocol_name(*proto), from, to);
     }
 
     Ok(())
@@ -222,7 +265,6 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
         let link = aya::programs::links::PinnedLink::from_pin(&link_pin)
             .context("failed to load pinned link")?;
         link.unpin().context("failed to unpin link")?;
-        // Dropping the FdLink detaches from interface
     }
 
     // Fallback: also try `ip link set xdp off` in case pin was stale
@@ -240,7 +282,7 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- Kernel / iptables setup ----
+// ---- Kernel setup ----
 
 fn setup_sysctl(interface: &str) {
     let sysctls = [
@@ -254,4 +296,3 @@ fn setup_sysctl(interface: &str) {
         .args(["-w", &format!("net.ipv4.conf.{}.accept_local=1", interface)])
         .output();
 }
-
