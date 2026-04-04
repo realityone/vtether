@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::{map, xdp},
-    maps::{HashMap, LruHashMap, PerCpuHashMap},
+    maps::{HashMap, PerCpuHashMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -116,19 +116,23 @@ static NAT_CONFIG: HashMap<NatKey, NatConfigEntry> = HashMap::with_max_entries(1
 #[map]
 static ROUTE_STATS: PerCpuHashMap<NatKey, RouteStats> = PerCpuHashMap::with_max_entries(128, 0);
 
-// Conntrack maps use a get-then-insert pattern that is not atomic across operations.
-// This is safe in practice because RSS/RPS steers packets of the same flow (same
-// src/dst IP + port tuple) to the same CPU, so concurrent access to the same entry
-// does not occur under normal conditions. See: https://docs.kernel.org/networking/scaling.html
+// Conntrack maps use HashMap (not LruHashMap) so active connections are never silently
+// evicted. When the map is full, new connections fail gracefully (packet passed without
+// NAT) instead of breaking existing ones. TCP entries are cleaned up on FIN/RST; UDP
+// entries linger until the map is cleared — size the map appropriately for UDP-heavy loads.
+//
+// The get-then-insert pattern is not atomic across operations, but is safe in practice
+// because RSS/RPS steers packets of the same flow (same src/dst IP + port tuple) to the
+// same CPU. See: https://docs.kernel.org/networking/scaling.html
 // In the rare case of a race (e.g. NIC without RSS), the worst outcome is an orphaned
-// LRU entry from a lost SNAT port allocation — no corruption or incorrect forwarding.
+// entry from a lost SNAT port allocation — no corruption or incorrect forwarding.
 #[map]
-static CONNTRACK_OUT: LruHashMap<ConntrackKey, ConntrackValue> =
-    LruHashMap::with_max_entries(65536, 0);
+static CONNTRACK_OUT: HashMap<ConntrackKey, ConntrackValue> =
+    HashMap::with_max_entries(65536, 0);
 
 #[map]
-static CONNTRACK_IN: LruHashMap<ConntrackRevKey, ConntrackRevValue> =
-    LruHashMap::with_max_entries(65536, 0);
+static CONNTRACK_IN: HashMap<ConntrackRevKey, ConntrackRevValue> =
+    HashMap::with_max_entries(65536, 0);
 
 // ---- Checksum helpers ----
 
@@ -389,9 +393,41 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             (existing.snat_port, false)
         } else {
             // New connection — allocate a unique SNAT source port.
-            // Try client's original port first; on collision, probe ephemeral range.
             let port =
                 allocate_snat_port(src_ip, src_port, new_dst_ip, new_dst_port_ne, protocol)?;
+
+            // Insert conntrack entries before rewriting the packet. If the map is full,
+            // pass the packet without NAT rather than rewriting it with no return path.
+            let fwd_val = ConntrackValue {
+                snat_ip: config.snat_ip,
+                dst_ip: config.dst_ip,
+                orig_dst_port: dst_port,
+                new_dst_port: new_dst_port_ne,
+                snat_port: port,
+                _pad: 0,
+            };
+            if CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0).is_err() {
+                return Ok(pass);
+            }
+
+            let rev_key = ConntrackRevKey {
+                dst_ip: config.dst_ip,
+                svc_port: new_dst_port_ne,
+                snat_port: port,
+                protocol,
+                _pad: [0; 3],
+            };
+            let rev_val = ConntrackRevValue {
+                client_ip: src_ip,
+                snat_ip: config.snat_ip,
+                orig_svc_port: dst_port,
+                client_port: src_port,
+            };
+            if CONNTRACK_IN.insert(&rev_key, &rev_val, 0).is_err() {
+                let _ = CONNTRACK_OUT.remove(&fwd_key);
+                return Ok(pass);
+            }
+
             (port, true)
         };
 
@@ -424,33 +460,6 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             src_port, snat_port,
         )?;
 
-        // Insert conntrack entries
-        let fwd_val = ConntrackValue {
-            snat_ip: config.snat_ip,
-            dst_ip: config.dst_ip,
-            orig_dst_port: dst_port,
-            new_dst_port: new_dst_port_ne,
-            snat_port,
-            _pad: 0,
-        };
-        let _ = CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0);
-
-        // Reverse key uses snat_port (what the backend sees as destination in reply)
-        let rev_key = ConntrackRevKey {
-            dst_ip: config.dst_ip,
-            svc_port: new_dst_port_ne,
-            snat_port,
-            protocol,
-            _pad: [0; 3],
-        };
-        let rev_val = ConntrackRevValue {
-            client_ip: src_ip,
-            snat_ip: config.snat_ip,
-            orig_svc_port: dst_port,
-            client_port: src_port,
-        };
-        let _ = CONNTRACK_IN.insert(&rev_key, &rev_val, 0);
-
         // Update per-route stats
         let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
         update_route_stats(&nat_key, pkt_len, new_conn);
@@ -461,6 +470,13 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
                 let flags = read_field(flags_ptr as *const u8);
                 if flags & (TCP_FIN | TCP_RST) != 0 {
                     let _ = CONNTRACK_OUT.remove(&fwd_key);
+                    let rev_key = ConntrackRevKey {
+                        dst_ip: new_dst_ip,
+                        svc_port: new_dst_port_ne,
+                        snat_port,
+                        protocol,
+                        _pad: [0; 3],
+                    };
                     let _ = CONNTRACK_IN.remove(&rev_key);
                 }
             }

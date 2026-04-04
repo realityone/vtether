@@ -588,7 +588,7 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
     if conntrack_out_path.exists() {
         let map_data = MapData::from_pin(&conntrack_out_path)
             .context("failed to load pinned CONNTRACK_OUT")?;
-        let map = Map::LruHashMap(map_data);
+        let map = Map::HashMap(map_data);
         let conntrack: HashMap<_, ConntrackKey, ConntrackValue> =
             HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
 
