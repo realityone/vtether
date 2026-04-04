@@ -29,12 +29,12 @@ interface: eth0
 
 routes:
   - protocol: tcp
-    from: "0.0.0.0:443"
+    port: 443
     to: "10.0.0.1:443"
   - protocol: udp
-    from: "0.0.0.0:53"
+    port: 53
     to: "10.0.0.2:53"
-  - from: "0.0.0.0:8080"
+  - port: 8080
     to: "10.0.0.3:8080"
 ```
 
@@ -43,7 +43,7 @@ routes:
 | `interface` | Network interface to attach XDP program to               |
 | `snat_ip`   | Source IP for SNAT (optional, auto-detected from interface)|
 | `protocol`  | `tcp` or `udp` (optional, defaults to `tcp`)             |
-| `from`      | Listen address and port                                  |
+| `port`      | Listen port on the interface                             |
 | `to`        | Backend address and port to forward traffic to           |
 
 ## Usage

@@ -72,7 +72,7 @@ fn default_protocol() -> String {
 struct RouteConfig {
     #[serde(default = "default_protocol")]
     protocol: String,
-    from: String,
+    port: u16,
     to: String,
 }
 
@@ -161,32 +161,28 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let snat_ip_be = u32::from(snat_ip).to_be();
 
     // Parse all routes upfront
-    let parsed_routes: Vec<(SocketAddrV4, SocketAddrV4, u8)> = config
+    let parsed_routes: Vec<(u16, SocketAddrV4, u8)> = config
         .routes
         .iter()
         .map(|r| {
             let proto = parse_protocol(&r.protocol)
-                .with_context(|| format!("in route {} -> {}", r.from, r.to))?;
-            let from: SocketAddrV4 = r
-                .from
-                .parse()
-                .with_context(|| format!("invalid 'from' address: {}", r.from))?;
+                .with_context(|| format!("in route :{} -> {}", r.port, r.to))?;
             let to: SocketAddrV4 = r
                 .to
                 .parse()
                 .with_context(|| format!("invalid 'to' address: {}", r.to))?;
-            Ok((from, to, proto))
+            Ok((r.port, to, proto))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Check for duplicate (port, protocol) pairs
     let mut seen = std::collections::HashSet::new();
-    for (from, _, proto) in &parsed_routes {
+    for (port, _, proto) in &parsed_routes {
         anyhow::ensure!(
-            seen.insert((from.port(), *proto)),
+            seen.insert((*port, *proto)),
             "duplicate route: {}/{}",
             protocol_name(*proto),
-            from.port()
+            port
         );
     }
 
@@ -209,9 +205,9 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let mut nat_config: HashMap<_, NatKey, NatConfigEntry> =
         HashMap::try_from(ebpf.map_mut("NAT_CONFIG").context("NAT_CONFIG map not found")?)?;
 
-    for (from, to, proto) in &parsed_routes {
+    for (port, to, proto) in &parsed_routes {
         let key = NatKey {
-            port: from.port(),
+            port: *port,
             protocol: *proto,
             _pad: 0,
         };
@@ -276,9 +272,9 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     setup_sysctl(&config.interface)?;
 
     println!("vtether: proxy up (xdp on {}, snat_ip: {})", config.interface, snat_ip);
-    for (from, to, proto) in &parsed_routes {
-        println!("  {} {} -> {}", protocol_name(*proto), from, to);
-        info!("route: {} {} -> {}", protocol_name(*proto), from, to);
+    for (port, to, proto) in &parsed_routes {
+        println!("  {} :{} -> {}", protocol_name(*proto), port, to);
+        info!("route: {} :{} -> {}", protocol_name(*proto), port, to);
     }
 
     Ok(())
