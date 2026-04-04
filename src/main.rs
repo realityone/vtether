@@ -313,9 +313,12 @@ interface: {default_iface}
 # Source IP for SNAT (optional, auto-detected from interface)
 # snat_ip: \"192.168.1.100\"
 
+# Max conntrack entries (default: 65536)
+# conntrack_size: 65536
+
 # Forwarding routes
 # routes:
-#   - protocol: tcp
+#   - protocol: tcp    # tcp or udp (default: tcp)
 #     port: 443
 #     to: \"10.0.0.1:443\"
 #   - protocol: udp
