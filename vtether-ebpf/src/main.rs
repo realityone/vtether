@@ -234,6 +234,34 @@ fn update_route_stats(nat_key: &NatKey, pkt_len: u64, new_conn: bool) {
     }
 }
 
+/// Check TCP flags and update conntrack state. Returns true if the entry should be removed.
+#[inline(always)]
+fn update_tcp_state(
+    ctx: &XdpContext,
+    transport_offset: usize,
+    fwd_key: &ConntrackKey,
+    fin_bit: u8,
+) -> bool {
+    let flags_ptr = match ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
+        Ok(p) => p,
+        Err(()) => return false,
+    };
+    let flags = read_field(flags_ptr as *const u8);
+    match (flags & TCP_RST != 0, flags & TCP_FIN != 0) {
+        (true, _) => true,
+        (false, true) => match CONNTRACK_OUT.get_ptr_mut(fwd_key) {
+            Some(entry) => {
+                let state = unsafe { (*entry).tcp_state } | fin_bit;
+                unsafe { (*entry).tcp_state = state };
+                state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
+                    == (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 // ---- XDP program ----
 
 #[xdp]
@@ -343,10 +371,9 @@ fn allocate_snat_port(
         if unsafe { CONNTRACK_IN.get(&try_key) }.is_none() {
             return Ok(candidate);
         }
-        port_host = if port_host >= EPHEMERAL_HI {
-            EPHEMERAL_LO
-        } else {
-            port_host + 1
+        port_host = match port_host {
+            EPHEMERAL_HI.. => EPHEMERAL_LO,
+            _ => port_host + 1,
         };
         i += 1;
     }
@@ -360,9 +387,9 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
 
     // --- Parse Ethernet ---
     let eth: *const EthHdr = ptr_at(ctx, 0)?;
-    let ether_type = read_field(unsafe { addr_of!((*eth).ether_type) });
-    if u16::from_be(ether_type) != ETH_P_IP {
-        return Ok(pass);
+    match u16::from_be(read_field(unsafe { addr_of!((*eth).ether_type) })) {
+        ETH_P_IP => {}
+        _ => return Ok(pass),
     }
 
     // --- Parse IPv4 ---
@@ -506,36 +533,18 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         update_route_stats(&nat_key, pkt_len, new_conn);
 
         // Clean up conntrack on TCP RST or after both FINs seen
-        if protocol == IPPROTO_TCP {
-            if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
-                let flags = read_field(flags_ptr as *const u8);
-                let should_remove = if flags & TCP_RST != 0 {
-                    true
-                } else if flags & TCP_FIN != 0 {
-                    // Set FIN_CLIENT bit in forward path
-                    if let Some(entry) = CONNTRACK_OUT.get_ptr_mut(&fwd_key) {
-                        let state = unsafe { (*entry).tcp_state } | TCP_STATE_FIN_CLIENT;
-                        unsafe { (*entry).tcp_state = state };
-                        state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
-                            == (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if should_remove {
-                    let _ = CONNTRACK_OUT.remove(&fwd_key);
-                    let rev_key = ConntrackRevKey {
-                        dst_ip: new_dst_ip,
-                        svc_port: new_dst_port_ne,
-                        snat_port,
-                        protocol,
-                        _pad: [0; 3],
-                    };
-                    let _ = CONNTRACK_IN.remove(&rev_key);
-                }
-            }
+        if protocol == IPPROTO_TCP
+            && update_tcp_state(ctx, transport_offset, &fwd_key, TCP_STATE_FIN_CLIENT)
+        {
+            let _ = CONNTRACK_OUT.remove(&fwd_key);
+            let rev_key = ConntrackRevKey {
+                dst_ip: new_dst_ip,
+                svc_port: new_dst_port_ne,
+                snat_port,
+                protocol,
+                _pad: [0; 3],
+            };
+            let _ = CONNTRACK_IN.remove(&rev_key);
         }
 
         return Ok(pass);
@@ -610,35 +619,16 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
 
         // Clean up conntrack on TCP RST or after both FINs seen
         if protocol == IPPROTO_TCP {
-            if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
-                let flags = read_field(flags_ptr as *const u8);
-                // Reconstruct forward key from reverse conntrack entry
-                let fwd_key = ConntrackKey {
-                    client_ip: new_dst_ip,
-                    client_port,
-                    svc_port: orig_svc_port,
-                    protocol,
-                    _pad: [0; 3],
-                };
-                let should_remove = if flags & TCP_RST != 0 {
-                    true
-                } else if flags & TCP_FIN != 0 {
-                    // Set FIN_SERVER bit in return path
-                    if let Some(entry) = CONNTRACK_OUT.get_ptr_mut(&fwd_key) {
-                        let state = unsafe { (*entry).tcp_state } | TCP_STATE_FIN_SERVER;
-                        unsafe { (*entry).tcp_state = state };
-                        state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
-                            == (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if should_remove {
-                    let _ = CONNTRACK_OUT.remove(&fwd_key);
-                    let _ = CONNTRACK_IN.remove(&rev_key);
-                }
+            let fwd_key = ConntrackKey {
+                client_ip: new_dst_ip,
+                client_port,
+                svc_port: orig_svc_port,
+                protocol,
+                _pad: [0; 3],
+            };
+            if update_tcp_state(ctx, transport_offset, &fwd_key, TCP_STATE_FIN_SERVER) {
+                let _ = CONNTRACK_OUT.remove(&fwd_key);
+                let _ = CONNTRACK_IN.remove(&rev_key);
             }
         }
 

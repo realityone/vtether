@@ -606,37 +606,31 @@ fn ktime_get_ns() -> u64 {
     ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
 }
 
+fn tcp_state_info(tcp_state: u8) -> (&'static str, u64) {
+    let est = tcp_state & TCP_STATE_ESTABLISHED != 0;
+    let fin_c = tcp_state & TCP_STATE_FIN_CLIENT != 0;
+    let fin_s = tcp_state & TCP_STATE_FIN_SERVER != 0;
+    match (est, fin_c, fin_s) {
+        (false, _, _) => ("SYN_SENT", TCP_TIMEOUT_SYN_SENT),
+        (true, false, false) => ("ESTABLISHED", TCP_TIMEOUT_ESTABLISHED),
+        (true, true, true) => ("CLOSE", TCP_TIMEOUT_CLOSE),
+        (true, _, _) => ("FIN_WAIT", TCP_TIMEOUT_FIN_WAIT),
+    }
+}
+
 /// Return the timeout in nanoseconds for a conntrack entry based on protocol and TCP state.
 fn conntrack_timeout_ns(protocol: u8, tcp_state: u8) -> u64 {
-    let secs = if protocol == IPPROTO_TCP {
-        let has_established = tcp_state & TCP_STATE_ESTABLISHED != 0;
-        let has_fin_client = tcp_state & TCP_STATE_FIN_CLIENT != 0;
-        let has_fin_server = tcp_state & TCP_STATE_FIN_SERVER != 0;
-        match (has_established, has_fin_client, has_fin_server) {
-            (false, _, _) => TCP_TIMEOUT_SYN_SENT,
-            (true, false, false) => TCP_TIMEOUT_ESTABLISHED,
-            (true, true, true) => TCP_TIMEOUT_CLOSE,
-            (true, _, _) => TCP_TIMEOUT_FIN_WAIT,
-        }
-    } else {
-        UDP_TIMEOUT
+    let secs = match protocol {
+        IPPROTO_TCP => tcp_state_info(tcp_state).1,
+        _ => UDP_TIMEOUT,
     };
     secs * 1_000_000_000
 }
 
 fn conntrack_state_name(protocol: u8, tcp_state: u8) -> &'static str {
-    if protocol == IPPROTO_TCP {
-        let has_established = tcp_state & TCP_STATE_ESTABLISHED != 0;
-        let has_fin_client = tcp_state & TCP_STATE_FIN_CLIENT != 0;
-        let has_fin_server = tcp_state & TCP_STATE_FIN_SERVER != 0;
-        match (has_established, has_fin_client, has_fin_server) {
-            (false, _, _) => "SYN_SENT",
-            (true, false, false) => "ESTABLISHED",
-            (true, true, true) => "CLOSE",
-            (true, _, _) => "FIN_WAIT",
-        }
-    } else {
-        "ACTIVE"
+    match protocol {
+        IPPROTO_TCP => tcp_state_info(tcp_state).0,
+        _ => "ACTIVE",
     }
 }
 
@@ -860,16 +854,12 @@ fn format_bytes(bytes: u64) -> String {
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
     const TIB: u64 = 1024 * GIB;
-    if bytes >= TIB {
-        format!("{:.2} TiB", bytes as f64 / TIB as f64)
-    } else if bytes >= GIB {
-        format!("{:.2} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.2} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.2} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{} B", bytes)
+    match bytes {
+        TIB.. => format!("{:.2} TiB", bytes as f64 / TIB as f64),
+        GIB.. => format!("{:.2} GiB", bytes as f64 / GIB as f64),
+        MIB.. => format!("{:.2} MiB", bytes as f64 / MIB as f64),
+        KIB.. => format!("{:.2} KiB", bytes as f64 / KIB as f64),
+        _ => format!("{} B", bytes),
     }
 }
 
