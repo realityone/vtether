@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use aya::maps::HashMap;
+use aya::maps::{HashMap, Map, MapData};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
@@ -10,9 +10,9 @@ use log::info;
 use serde::Deserialize;
 
 const DEFAULT_PIN_PATH: &str = "/sys/fs/bpf/vtether";
-const STATE_DIR: &str = "/run/vtether";
 const DEFAULT_CONFIG_PATH: &str = "/etc/vtether/config.yaml";
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
+const STATE_BASE_DIR: &str = "/run/vtether";
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -35,6 +35,14 @@ enum Commands {
     },
     /// Install systemd unit file and default config
     Setup,
+    /// Show version information
+    Version,
+    /// Inspect active forwarding rules and connection metrics
+    Inspect {
+        /// bpffs pin path used during `proxy up`
+        #[arg(long, default_value = DEFAULT_PIN_PATH)]
+        pin_path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,6 +112,31 @@ struct NatConfigEntry {
 
 unsafe impl aya::Pod for NatConfigEntry {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConntrackKey {
+    client_ip: u32,
+    client_port: u16,
+    svc_port: u16,
+    protocol: u8,
+    _pad: [u8; 3],
+}
+
+unsafe impl aya::Pod for ConntrackKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConntrackValue {
+    snat_ip: u32,
+    dst_ip: u32,
+    orig_dst_port: u16,
+    new_dst_port: u16,
+    snat_port: u16,
+    _pad: u16,
+}
+
+unsafe impl aya::Pod for ConntrackValue {}
+
 // ---- Main ----
 
 fn main() -> anyhow::Result<()> {
@@ -116,7 +149,38 @@ fn main() -> anyhow::Result<()> {
             ProxyAction::Down { pin_path } => proxy_down(pin_path),
         },
         Commands::Setup => setup(),
+        Commands::Version => {
+            print_version();
+            Ok(())
+        }
+        Commands::Inspect { pin_path } => inspect(pin_path),
     }
+}
+
+/// Compute a per-instance state directory under /run/vtether/ derived from the pin path.
+/// bpffs only supports BPF object pins, so regular files (like interface name) go here.
+fn state_dir_for(pin_path: &std::path::Path) -> PathBuf {
+    // Use the pin path's last component as the instance name
+    let instance = pin_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "default".to_string());
+    PathBuf::from(STATE_BASE_DIR).join(instance)
+}
+
+fn print_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    let commit = env!("VT_COMMIT");
+    let dirty: bool = env!("VT_DIRTY").parse().unwrap_or(false);
+    let build_date = env!("VT_BUILD_DATE");
+
+    let version_suffix = if dirty { "-dev" } else { "" };
+    let commit_suffix = if dirty { "-dirty" } else { "" };
+
+    println!(
+        "vtether {}{} (commit {}{}, built {})",
+        version, version_suffix, commit, commit_suffix, build_date
+    );
 }
 
 fn parse_protocol(s: &str) -> anyhow::Result<u8> {
@@ -259,6 +323,14 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let config: Config =
         serde_yaml::from_str(&config_str).context("failed to parse config YAML")?;
 
+    // Check if already running before anything else
+    let prog_pin = pin_path.join("prog");
+    anyhow::ensure!(
+        !prog_pin.exists(),
+        "proxy already running (pin {} exists). Run `vtether proxy down` first.",
+        prog_pin.display()
+    );
+
     if config.routes.is_empty() {
         println!("vtether: no routes defined in {}, nothing to do", config_path.display());
         return Ok(());
@@ -298,14 +370,6 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         );
     }
 
-    // Check if already running
-    let prog_pin = pin_path.join("prog");
-    anyhow::ensure!(
-        !prog_pin.exists(),
-        "proxy already running (pin {} exists). Run `vtether proxy down` first.",
-        prog_pin.display()
-    );
-
     // Load eBPF
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -314,22 +378,39 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     .context("failed to load eBPF bytecode")?;
 
     // Populate NAT_CONFIG map
-    let mut nat_config: HashMap<_, NatKey, NatConfigEntry> =
-        HashMap::try_from(ebpf.map_mut("NAT_CONFIG").context("NAT_CONFIG map not found")?)?;
+    {
+        let mut nat_config: HashMap<_, NatKey, NatConfigEntry> =
+            HashMap::try_from(ebpf.map_mut("NAT_CONFIG").context("NAT_CONFIG map not found")?)?;
 
-    for (port, to, proto) in &parsed_routes {
-        let key = NatKey {
-            port: *port,
-            protocol: *proto,
-            _pad: 0,
-        };
-        let entry = NatConfigEntry {
-            dst_ip: u32::from(*to.ip()).to_be(),
-            snat_ip: snat_ip_be,
-            dst_port: to.port().to_be(),
-            _pad: 0,
-        };
-        nat_config.insert(key, entry, 0)?;
+        for (port, to, proto) in &parsed_routes {
+            let key = NatKey {
+                port: *port,
+                protocol: *proto,
+                _pad: 0,
+            };
+            let entry = NatConfigEntry {
+                dst_ip: u32::from(*to.ip()).to_be(),
+                snat_ip: snat_ip_be,
+                dst_port: to.port().to_be(),
+                _pad: 0,
+            };
+            nat_config.insert(key, entry, 0)?;
+        }
+    }
+
+    // Create pin directory and pin maps before taking mutable program reference
+    std::fs::create_dir_all(&pin_path)
+        .with_context(|| format!("failed to create pin dir: {}", pin_path.display()))?;
+
+    for (name, pin_name) in [
+        ("NAT_CONFIG", "nat_config"),
+        ("CONNTRACK_OUT", "conntrack_out"),
+        ("CONNTRACK_IN", "conntrack_in"),
+    ] {
+        if let Some(map) = ebpf.map(name) {
+            map.pin(pin_path.join(pin_name))
+                .with_context(|| format!("failed to pin {} map", name))?;
+        }
     }
 
     // Load and attach XDP program
@@ -345,10 +426,8 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         .with_context(|| format!("failed to attach XDP to {}", config.interface))?;
 
     // From here on, use a closure to clean up on failure.
+    let state_dir = state_dir_for(&pin_path);
     let finish = || -> anyhow::Result<()> {
-        std::fs::create_dir_all(&pin_path)
-            .with_context(|| format!("failed to create pin dir: {}", pin_path.display()))?;
-
         prog.pin(&prog_pin)
             .context("failed to pin program to bpffs")?;
 
@@ -360,28 +439,31 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
             .pin(pin_path.join("link"))
             .context("failed to pin XDP link to bpffs")?;
 
-        // Save state for `proxy down`
-        let state_dir = PathBuf::from(STATE_DIR);
+        // Save state for `proxy down` in a regular filesystem directory
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("failed to create state dir: {}", state_dir.display()))?;
         std::fs::write(state_dir.join("interface"), &config.interface)?;
+
+        // Configure kernel for XDP NAT forwarding
+        setup_sysctl(&config.interface)?;
 
         Ok(())
     };
 
     if let Err(e) = finish() {
-        // Clean up: detach XDP and remove any partial pins
+        // Clean up: detach XDP and remove any partial pins/state
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "dev", &config.interface, "xdp", "off"])
             .status();
         let _ = std::fs::remove_file(&prog_pin);
         let _ = std::fs::remove_file(pin_path.join("link"));
+        for pin_name in ["nat_config", "conntrack_out", "conntrack_in"] {
+            let _ = std::fs::remove_file(pin_path.join(pin_name));
+        }
         let _ = std::fs::remove_dir(&pin_path);
+        let _ = std::fs::remove_dir_all(&state_dir);
         return Err(e.context("proxy up failed, cleaned up partial state"));
     }
-
-    // Configure kernel for XDP NAT forwarding
-    setup_sysctl(&config.interface)?;
 
     println!("vtether: proxy up (xdp on {}, snat_ip: {})", config.interface, snat_ip);
     for (port, to, proto) in &parsed_routes {
@@ -400,8 +482,8 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
         prog_pin.display()
     );
 
-    // Read saved interface name
-    let state_dir = PathBuf::from(STATE_DIR);
+    // Read saved interface name from state directory
+    let state_dir = state_dir_for(&pin_path);
     let interface = std::fs::read_to_string(state_dir.join("interface"))
         .context("failed to read interface; was proxy started with `proxy up`?")?;
 
@@ -418,12 +500,75 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
         .args(["link", "set", "dev", interface.trim(), "xdp", "off"])
         .status();
 
-    // Unpin program and clean up
+    // Unpin program, maps, and clean up
     let _ = std::fs::remove_file(&prog_pin);
+    for pin_name in ["nat_config", "conntrack_out", "conntrack_in"] {
+        let _ = std::fs::remove_file(pin_path.join(pin_name));
+    }
     let _ = std::fs::remove_dir(&pin_path);
     let _ = std::fs::remove_dir_all(&state_dir);
 
     println!("vtether: proxy down (detached from {})", interface.trim());
+
+    Ok(())
+}
+
+fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
+    let prog_pin = pin_path.join("prog");
+    anyhow::ensure!(
+        prog_pin.exists(),
+        "no running proxy found (pin {} does not exist)",
+        prog_pin.display()
+    );
+
+    let state_dir = state_dir_for(&pin_path);
+    let interface = std::fs::read_to_string(state_dir.join("interface"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    println!("vtether: attached to {}", interface.trim());
+
+    // Read NAT_CONFIG map — show configured routes
+    let nat_config_path = pin_path.join("nat_config");
+    if nat_config_path.exists() {
+        let map_data =
+            MapData::from_pin(&nat_config_path).context("failed to load pinned NAT_CONFIG")?;
+        let map = Map::HashMap(map_data);
+        let nat_config: HashMap<_, NatKey, NatConfigEntry> =
+            HashMap::try_from(map).context("failed to parse NAT_CONFIG map")?;
+
+        println!("\nRoutes:");
+        for item in nat_config.iter() {
+            let (key, entry) = item.map_err(|e| anyhow::anyhow!("map iteration error: {}", e))?;
+            let dst_ip = Ipv4Addr::from(u32::from_be(entry.dst_ip));
+            let snat_ip = Ipv4Addr::from(u32::from_be(entry.snat_ip));
+            let dst_port = u16::from_be(entry.dst_port);
+            println!(
+                "  {} :{} -> {}:{} (snat: {})",
+                protocol_name(key.protocol),
+                key.port,
+                dst_ip,
+                dst_port,
+                snat_ip,
+            );
+        }
+    }
+
+    // Read CONNTRACK_OUT map — count active connections
+    let conntrack_out_path = pin_path.join("conntrack_out");
+    if conntrack_out_path.exists() {
+        let map_data = MapData::from_pin(&conntrack_out_path)
+            .context("failed to load pinned CONNTRACK_OUT")?;
+        let map = Map::LruHashMap(map_data);
+        let conntrack: HashMap<_, ConntrackKey, ConntrackValue> =
+            HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
+
+        let mut count: usize = 0;
+        for item in conntrack.iter() {
+            if item.is_ok() {
+                count += 1;
+            }
+        }
+        println!("\nActive connections: {}", count);
+    }
 
     Ok(())
 }

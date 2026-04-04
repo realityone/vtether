@@ -44,26 +44,6 @@ struct Ipv4Hdr {
     dst_addr: u32,
 }
 
-#[repr(C, packed)]
-struct TcpHdr {
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack_seq: u32,
-    doff_flags: u16,
-    window: u16,
-    check: u16,
-    urg_ptr: u16,
-}
-
-#[repr(C, packed)]
-struct UdpHdr {
-    src_port: u16,
-    dst_port: u16,
-    len: u16,
-    check: u16,
-}
-
 // ---- Map key/value types ----
 
 #[repr(C)]
@@ -273,7 +253,7 @@ fn allocate_snat_port(
     let start = EPHEMERAL_LO + ((hash >> 8) % EPHEMERAL_RANGE) as u16;
     let mut port_host = start;
     let mut i: u32 = 0;
-    while i < 32 {
+    while i < 128 {
         let candidate = port_host.to_be();
         let try_key = ConntrackRevKey {
             dst_ip,
@@ -314,6 +294,16 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         IPPROTO_TCP | IPPROTO_UDP => {}
         _ => return Ok(pass),
     }
+    // Drop non-initial fragments: they lack transport headers so we can't NAT them.
+    // frag_off field: bits [15:13] = flags, bits [12:0] = fragment offset.
+    // We check the MF (More Fragments) flag is irrelevant; what matters is offset != 0.
+    let frag_off = u16::from_be(read_field(unsafe { addr_of!((*ip).frag_off) }));
+    let frag_offset = frag_off & 0x1FFF; // lower 13 bits = fragment offset
+    if frag_offset != 0 {
+        // Non-initial fragment — pass without rewriting to avoid half-NATing the flow
+        return Ok(pass);
+    }
+
     let ver_ihl = read_field(unsafe { addr_of!((*ip).ver_ihl) });
     let ihl = (ver_ihl & 0x0F) as usize;
     let ip_hdr_len = ihl * 4;
