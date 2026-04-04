@@ -77,6 +77,8 @@ pub struct NatKey {
 pub struct NatConfigEntry {
     pub dst_ip: u32,
     pub snat_ip: u32,
+    pub dst_port: u16,
+    pub _pad: u16,
 }
 
 #[repr(C)]
@@ -92,13 +94,17 @@ pub struct ConntrackKey {
 pub struct ConntrackValue {
     pub snat_ip: u32,
     pub dst_ip: u32,
+    pub orig_dst_port: u16,
+    pub new_dst_port: u16,
+    pub snat_port: u16,
+    pub _pad: u16,
 }
 
 #[repr(C)]
 pub struct ConntrackRevKey {
     pub dst_ip: u32,
     pub svc_port: u16,
-    pub client_port: u16,
+    pub snat_port: u16,
     pub protocol: u8,
     pub _pad: [u8; 3],
 }
@@ -107,6 +113,8 @@ pub struct ConntrackRevKey {
 pub struct ConntrackRevValue {
     pub client_ip: u32,
     pub snat_ip: u32,
+    pub orig_svc_port: u16,
+    pub client_port: u16,
 }
 
 // ---- Maps ----
@@ -130,6 +138,18 @@ fn csum_fold(mut csum: u64) -> u16 {
     csum = (csum & 0xFFFF) + (csum >> 16);
     csum = (csum & 0xFFFF) + (csum >> 16);
     !(csum as u16)
+}
+
+/// Incrementally update a checksum when a 16-bit field changes.
+/// All values are raw from the packet (network byte order).
+#[inline(always)]
+fn csum_replace2(check_ptr: *mut u16, old: u16, new: u16) {
+    let old_check = unsafe { core::ptr::read_unaligned(check_ptr) };
+    let mut csum = !(old_check) as u64;
+    csum += !(old) as u64;
+    csum += new as u64;
+    let folded = csum_fold(csum);
+    unsafe { core::ptr::write_unaligned(check_ptr, folded) };
 }
 
 /// Incrementally update a checksum when a 32-bit field changes.
@@ -177,30 +197,104 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     Ok(ptr as *mut T)
 }
 
-/// Update the transport-layer (TCP or UDP) checksum after IP address rewrites.
+/// Update the transport-layer (TCP or UDP) checksum after IP and/or port rewrites.
+/// Port values are in network byte order; pass equal old/new to skip a port update.
 #[inline(always)]
 fn update_transport_csum(
     ctx: &XdpContext,
     transport_offset: usize,
     protocol: u8,
-    old1: u32,
-    new1: u32,
-    old2: u32,
-    new2: u32,
+    old_ip1: u32,
+    new_ip1: u32,
+    old_ip2: u32,
+    new_ip2: u32,
+    old_port1: u16,
+    new_port1: u16,
+    old_port2: u16,
+    new_port2: u16,
 ) -> Result<(), ()> {
-    if protocol == IPPROTO_TCP {
-        let ck: *mut u16 = ptr_at(ctx, transport_offset + TCP_CSUM_OFF)?;
-        csum_replace4(ck, old1, new1);
-        csum_replace4(ck, old2, new2);
-    } else {
-        // UDP: checksum of 0 means "not computed", don't touch it
-        let ck: *mut u16 = ptr_at(ctx, transport_offset + UDP_CSUM_OFF)?;
-        if read_field(ck as *const u16) != 0 {
-            csum_replace4(ck, old1, new1);
-            csum_replace4(ck, old2, new2);
+    let (ck, skip) = match protocol {
+        IPPROTO_TCP => (ptr_at::<u16>(ctx, transport_offset + TCP_CSUM_OFF)?, false),
+        IPPROTO_UDP => {
+            let ck = ptr_at::<u16>(ctx, transport_offset + UDP_CSUM_OFF)?;
+            // UDP: checksum of 0 means "not computed", don't touch it
+            (ck, read_field(ck as *const u16) == 0)
+        }
+        _ => return Ok(()),
+    };
+
+    if !skip {
+        csum_replace4(ck, old_ip1, new_ip1);
+        csum_replace4(ck, old_ip2, new_ip2);
+        if old_port1 != new_port1 {
+            csum_replace2(ck, old_port1, new_port1);
+        }
+        if old_port2 != new_port2 {
+            csum_replace2(ck, old_port2, new_port2);
         }
     }
     Ok(())
+}
+
+/// Allocate a unique SNAT source port for a new connection.
+/// Tries the client's original port first; on collision, probes the ephemeral range.
+/// Returns the allocated port in network byte order.
+#[inline(always)]
+fn allocate_snat_port(
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+    protocol: u8,
+) -> Result<u16, ()> {
+    // Try the client's original port first (most common case, no rewrite needed)
+    let try_key = ConntrackRevKey {
+        dst_ip,
+        svc_port: dst_port,
+        snat_port: src_port,
+        protocol,
+        _pad: [0; 3],
+    };
+    if unsafe { CONNTRACK_IN.get(&try_key) }.is_none() {
+        return Ok(src_port);
+    }
+
+    // Collision — hash the connection tuple to pick a starting ephemeral port
+    let hash = src_ip
+        .wrapping_mul(0x9e3779b9)
+        .wrapping_add(((src_port as u32) << 16) | (dst_port as u32))
+        .wrapping_mul(0x517cc1b7);
+
+    // Ephemeral port range: 32768–60999 (28232 ports)
+    const EPHEMERAL_LO: u16 = 32768;
+    const EPHEMERAL_HI: u16 = 60999;
+    const EPHEMERAL_RANGE: u32 = (EPHEMERAL_HI - EPHEMERAL_LO + 1) as u32;
+
+    let start = EPHEMERAL_LO + ((hash >> 8) % EPHEMERAL_RANGE) as u16;
+    let mut port_host = start;
+    let mut i: u32 = 0;
+    while i < 32 {
+        let candidate = port_host.to_be();
+        let try_key = ConntrackRevKey {
+            dst_ip,
+            svc_port: dst_port,
+            snat_port: candidate,
+            protocol,
+            _pad: [0; 3],
+        };
+        if unsafe { CONNTRACK_IN.get(&try_key) }.is_none() {
+            return Ok(candidate);
+        }
+        port_host = if port_host >= EPHEMERAL_HI {
+            EPHEMERAL_LO
+        } else {
+            port_host + 1
+        };
+        i += 1;
+    }
+
+    // All attempted ports taken — cannot NAT this packet
+    Err(())
 }
 
 fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
@@ -216,8 +310,9 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     // --- Parse IPv4 ---
     let ip: *mut Ipv4Hdr = ptr_at(ctx, ETH_HDR_LEN)?;
     let protocol = read_field(unsafe { addr_of!((*ip).protocol) });
-    if protocol != IPPROTO_TCP && protocol != IPPROTO_UDP {
-        return Ok(pass);
+    match protocol {
+        IPPROTO_TCP | IPPROTO_UDP => {}
+        _ => return Ok(pass),
     }
     let ver_ihl = read_field(unsafe { addr_of!((*ip).ver_ihl) });
     let ihl = (ver_ihl & 0x0F) as usize;
@@ -245,22 +340,11 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         _pad: 0,
     };
     if let Some(config) = unsafe { NAT_CONFIG.get(&nat_key) } {
-        let new_dst = config.dst_ip;
-        let new_src = config.snat_ip;
+        let new_dst_ip = config.dst_ip;
+        let new_src_ip = config.snat_ip;
+        let new_dst_port_ne = config.dst_port; // already in network byte order
 
-        // DNAT + SNAT
-        write_field(unsafe { addr_of_mut!((*ip).dst_addr) }, new_dst);
-        write_field(unsafe { addr_of_mut!((*ip).src_addr) }, new_src);
-
-        // Update IP header checksum
-        let ip_ck = unsafe { addr_of_mut!((*ip).check) };
-        csum_replace4(ip_ck, dst_ip, new_dst);
-        csum_replace4(ip_ck, src_ip, new_src);
-
-        // Update transport checksum
-        update_transport_csum(ctx, transport_offset, protocol, dst_ip, new_dst, src_ip, new_src)?;
-
-        // Insert conntrack entries
+        // Check for existing conntrack entry (subsequent packets of same connection)
         let fwd_key = ConntrackKey {
             client_ip: src_ip,
             client_port: src_port,
@@ -268,50 +352,116 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             protocol,
             _pad: [0; 3],
         };
+
+        let snat_port = if let Some(existing) = unsafe { CONNTRACK_OUT.get(&fwd_key) } {
+            existing.snat_port
+        } else {
+            // New connection — allocate a unique SNAT source port.
+            // Try client's original port first; on collision, probe ephemeral range.
+            allocate_snat_port(src_ip, src_port, new_dst_ip, new_dst_port_ne, protocol)?
+        };
+
+        // DNAT + SNAT (IP addresses)
+        write_field(unsafe { addr_of_mut!((*ip).dst_addr) }, new_dst_ip);
+        write_field(unsafe { addr_of_mut!((*ip).src_addr) }, new_src_ip);
+
+        // DNAT (destination port)
+        if dst_port != new_dst_port_ne {
+            let dst_port_wr: *mut u16 = ptr_at(ctx, transport_offset + 2)?;
+            write_field(dst_port_wr, new_dst_port_ne);
+        }
+
+        // SNAT (source port)
+        if src_port != snat_port {
+            let src_port_wr: *mut u16 = ptr_at(ctx, transport_offset)?;
+            write_field(src_port_wr, snat_port);
+        }
+
+        // Update IP header checksum (ports don't affect IP checksum)
+        let ip_ck = unsafe { addr_of_mut!((*ip).check) };
+        csum_replace4(ip_ck, dst_ip, new_dst_ip);
+        csum_replace4(ip_ck, src_ip, new_src_ip);
+
+        // Update transport checksum (IPs + both ports)
+        update_transport_csum(
+            ctx, transport_offset, protocol,
+            dst_ip, new_dst_ip, src_ip, new_src_ip,
+            dst_port, new_dst_port_ne,
+            src_port, snat_port,
+        )?;
+
+        // Insert conntrack entries
         let fwd_val = ConntrackValue {
             snat_ip: config.snat_ip,
             dst_ip: config.dst_ip,
+            orig_dst_port: dst_port,
+            new_dst_port: new_dst_port_ne,
+            snat_port,
+            _pad: 0,
         };
         let _ = CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0);
 
+        // Reverse key uses snat_port (what the backend sees as destination in reply)
         let rev_key = ConntrackRevKey {
             dst_ip: config.dst_ip,
-            svc_port: dst_port,
-            client_port: src_port,
+            svc_port: new_dst_port_ne,
+            snat_port,
             protocol,
             _pad: [0; 3],
         };
         let rev_val = ConntrackRevValue {
             client_ip: src_ip,
             snat_ip: config.snat_ip,
+            orig_svc_port: dst_port,
+            client_port: src_port,
         };
         let _ = CONNTRACK_IN.insert(&rev_key, &rev_val, 0);
 
         return Ok(pass);
     }
 
-    // === RETURN PATH: DST_IP:svc_port -> THIS_MACHINE:client_port ===
+    // === RETURN PATH: backend_ip:svc_port -> snat_ip:snat_port ===
     let rev_key = ConntrackRevKey {
         dst_ip: src_ip,
         svc_port: src_port,
-        client_port: dst_port,
+        snat_port: dst_port,
         protocol,
         _pad: [0; 3],
     };
     if let Some(rev) = unsafe { CONNTRACK_IN.get(&rev_key) } {
-        let new_src = rev.snat_ip;
-        let new_dst = rev.client_ip;
+        let new_src_ip = rev.snat_ip;
+        let new_dst_ip = rev.client_ip;
+        let orig_svc_port = rev.orig_svc_port;
+        let client_port = rev.client_port;
 
-        // Reverse SNAT + DNAT
-        write_field(unsafe { addr_of_mut!((*ip).src_addr) }, new_src);
-        write_field(unsafe { addr_of_mut!((*ip).dst_addr) }, new_dst);
+        // Reverse SNAT + DNAT (IPs)
+        write_field(unsafe { addr_of_mut!((*ip).src_addr) }, new_src_ip);
+        write_field(unsafe { addr_of_mut!((*ip).dst_addr) }, new_dst_ip);
 
-        // Update checksums
+        // Reverse port rewrites
+        // src_port: backend port -> original service port
+        if src_port != orig_svc_port {
+            let src_port_wr: *mut u16 = ptr_at(ctx, transport_offset)?;
+            write_field(src_port_wr, orig_svc_port);
+        }
+        // dst_port: snat_port -> original client port
+        if dst_port != client_port {
+            let dst_port_wr: *mut u16 = ptr_at(ctx, transport_offset + 2)?;
+            write_field(dst_port_wr, client_port);
+        }
+
+        // Update IP checksum
         let ip_ck = unsafe { addr_of_mut!((*ip).check) };
-        csum_replace4(ip_ck, src_ip, new_src);
-        csum_replace4(ip_ck, dst_ip, new_dst);
+        csum_replace4(ip_ck, src_ip, new_src_ip);
+        csum_replace4(ip_ck, dst_ip, new_dst_ip);
 
-        update_transport_csum(ctx, transport_offset, protocol, src_ip, new_src, dst_ip, new_dst)?;
+        // Update transport checksum (IPs + both ports)
+        update_transport_csum(
+            ctx, transport_offset, protocol,
+            src_ip, new_src_ip, dst_ip, new_dst_ip,
+            src_port, orig_svc_port,
+            dst_port, client_port,
+        )?;
 
         return Ok(pass);
     }

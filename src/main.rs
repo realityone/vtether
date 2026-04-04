@@ -93,6 +93,8 @@ unsafe impl aya::Pod for NatKey {}
 struct NatConfigEntry {
     dst_ip: u32,
     snat_ip: u32,
+    dst_port: u16,
+    _pad: u16,
 }
 
 unsafe impl aya::Pod for NatConfigEntry {}
@@ -216,6 +218,8 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         let entry = NatConfigEntry {
             dst_ip: u32::from(*to.ip()).to_be(),
             snat_ip: snat_ip_be,
+            dst_port: to.port().to_be(),
+            _pad: 0,
         };
         nat_config.insert(key, entry, 0)?;
     }
@@ -227,32 +231,49 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         .try_into()?;
     prog.load().context("failed to load XDP program into kernel")?;
 
-    // Pin program to bpffs (keeps program + maps alive after exit)
-    std::fs::create_dir_all(&pin_path)
-        .with_context(|| format!("failed to create pin dir: {}", pin_path.display()))?;
-    prog.pin(&prog_pin)
-        .context("failed to pin program to bpffs")?;
-
-    // Attach to network interface and pin the link so it persists after exit
+    // Attach first, then pin — so partial failures don't leave stale pins.
     let link_id = prog
         .attach(&config.interface, XdpFlags::default())
         .with_context(|| format!("failed to attach XDP to {}", config.interface))?;
-    let link = prog.take_link(link_id)?;
-    let fd_link: FdLink = link
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("failed to convert XDP link to FdLink: {}", e))?;
-    fd_link
-        .pin(pin_path.join("link"))
-        .context("failed to pin XDP link to bpffs")?;
 
-    // Save state for `proxy down`
-    let state_dir = PathBuf::from(STATE_DIR);
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("failed to create state dir: {}", state_dir.display()))?;
-    std::fs::write(state_dir.join("interface"), &config.interface)?;
+    // From here on, use a closure to clean up on failure.
+    let finish = || -> anyhow::Result<()> {
+        std::fs::create_dir_all(&pin_path)
+            .with_context(|| format!("failed to create pin dir: {}", pin_path.display()))?;
+
+        prog.pin(&prog_pin)
+            .context("failed to pin program to bpffs")?;
+
+        let link = prog.take_link(link_id)?;
+        let fd_link: FdLink = link
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("failed to convert XDP link to FdLink: {}", e))?;
+        fd_link
+            .pin(pin_path.join("link"))
+            .context("failed to pin XDP link to bpffs")?;
+
+        // Save state for `proxy down`
+        let state_dir = PathBuf::from(STATE_DIR);
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("failed to create state dir: {}", state_dir.display()))?;
+        std::fs::write(state_dir.join("interface"), &config.interface)?;
+
+        Ok(())
+    };
+
+    if let Err(e) = finish() {
+        // Clean up: detach XDP and remove any partial pins
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", "dev", &config.interface, "xdp", "off"])
+            .status();
+        let _ = std::fs::remove_file(&prog_pin);
+        let _ = std::fs::remove_file(pin_path.join("link"));
+        let _ = std::fs::remove_dir(&pin_path);
+        return Err(e.context("proxy up failed, cleaned up partial state"));
+    }
 
     // Configure kernel for XDP NAT forwarding
-    setup_sysctl(&config.interface);
+    setup_sysctl(&config.interface)?;
 
     println!("vtether: proxy up (xdp on {}, snat_ip: {})", config.interface, snat_ip);
     for (from, to, proto) in &parsed_routes {
@@ -301,15 +322,21 @@ fn proxy_down(pin_path: PathBuf) -> anyhow::Result<()> {
 
 // ---- Kernel setup ----
 
-fn setup_sysctl(interface: &str) {
+fn setup_sysctl(interface: &str) -> anyhow::Result<()> {
     let sysctls = [
-        "net.ipv4.ip_forward=1",
-        "net.ipv4.conf.all.accept_local=1",
+        "net.ipv4.ip_forward=1".to_string(),
+        "net.ipv4.conf.all.accept_local=1".to_string(),
+        format!("net.ipv4.conf.{}.accept_local=1", interface),
     ];
     for s in &sysctls {
-        let _ = std::process::Command::new("sysctl").args(["-w", s]).output();
+        let output = std::process::Command::new("sysctl")
+            .args(["-w", s])
+            .output()
+            .with_context(|| format!("failed to run sysctl -w {}", s))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("sysctl -w {} failed: {}", s, stderr.trim());
+        }
     }
-    let _ = std::process::Command::new("sysctl")
-        .args(["-w", &format!("net.ipv4.conf.{}.accept_local=1", interface)])
-        .output();
+    Ok(())
 }
