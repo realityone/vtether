@@ -1,5 +1,5 @@
 interface: ens18
-this_ip: "192.168.50.212"
+# snat_ip: "192.168.50.212"  # optional, auto-detected from interface
 
 routes:
   - protocol: tcp

@@ -59,8 +59,8 @@ enum ProxyAction {
 struct Config {
     /// Network interface to attach XDP program to
     interface: String,
-    /// This machine's IP on that interface (used for SNAT)
-    this_ip: String,
+    /// IP address used as source in SNAT (auto-detected from interface if omitted)
+    snat_ip: Option<String>,
     routes: Vec<RouteConfig>,
 }
 
@@ -92,7 +92,7 @@ unsafe impl aya::Pod for NatKey {}
 #[derive(Clone, Copy)]
 struct NatConfigEntry {
     dst_ip: u32,
-    this_ip: u32,
+    snat_ip: u32,
 }
 
 unsafe impl aya::Pod for NatConfigEntry {}
@@ -127,6 +127,21 @@ fn protocol_name(proto: u8) -> &'static str {
     }
 }
 
+fn get_interface_ipv4(interface: &str) -> anyhow::Result<Ipv4Addr> {
+    let addrs = nix::ifaddrs::getifaddrs().context("failed to enumerate interface addresses")?;
+    for ifaddr in addrs {
+        if ifaddr.interface_name != interface {
+            continue;
+        }
+        if let Some(addr) = ifaddr.address {
+            if let Some(sockaddr) = addr.as_sockaddr_in() {
+                return Ok(Ipv4Addr::from(sockaddr.ip()));
+            }
+        }
+    }
+    anyhow::bail!("no IPv4 address found on interface '{}'", interface)
+}
+
 fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {}", config_path.display()))?;
@@ -135,11 +150,13 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
 
     anyhow::ensure!(!config.routes.is_empty(), "no routes defined in config");
 
-    let this_ip: Ipv4Addr = config
-        .this_ip
-        .parse()
-        .with_context(|| format!("invalid this_ip: {}", config.this_ip))?;
-    let this_ip_be = u32::from(this_ip).to_be();
+    let snat_ip: Ipv4Addr = match &config.snat_ip {
+        Some(ip_str) => ip_str
+            .parse()
+            .with_context(|| format!("invalid snat_ip: {}", ip_str))?,
+        None => get_interface_ipv4(&config.interface)?,
+    };
+    let snat_ip_be = u32::from(snat_ip).to_be();
 
     // Parse all routes upfront
     let parsed_routes: Vec<(SocketAddrV4, SocketAddrV4, u8)> = config
@@ -198,7 +215,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
         };
         let entry = NatConfigEntry {
             dst_ip: u32::from(*to.ip()).to_be(),
-            this_ip: this_ip_be,
+            snat_ip: snat_ip_be,
         };
         nat_config.insert(key, entry, 0)?;
     }
@@ -237,7 +254,7 @@ fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     // Configure kernel for XDP NAT forwarding
     setup_sysctl(&config.interface);
 
-    println!("vtether: proxy up (xdp on {}, this_ip: {})", config.interface, config.this_ip);
+    println!("vtether: proxy up (xdp on {}, snat_ip: {})", config.interface, snat_ip);
     for (from, to, proto) in &parsed_routes {
         println!("  {} {} -> {}", protocol_name(*proto), from, to);
         info!("route: {} {} -> {}", protocol_name(*proto), from, to);

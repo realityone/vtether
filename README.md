@@ -25,7 +25,7 @@ Create a YAML config file (e.g. `vtether.yaml`):
 
 ```yaml
 interface: eth0
-this_ip: "192.168.1.100"
+# snat_ip: "192.168.1.100"  # optional, auto-detected from interface
 
 routes:
   - protocol: tcp
@@ -41,7 +41,7 @@ routes:
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
 | `interface` | Network interface to attach XDP program to               |
-| `this_ip`   | This machine's IP on that interface (used for SNAT)      |
+| `snat_ip`   | Source IP for SNAT (optional, auto-detected from interface)|
 | `protocol`  | `tcp` or `udp` (optional, defaults to `tcp`)             |
 | `from`      | Listen address and port                                  |
 | `to`        | Backend address and port to forward traffic to           |
