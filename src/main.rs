@@ -11,6 +11,8 @@ use serde::Deserialize;
 
 const DEFAULT_PIN_PATH: &str = "/sys/fs/bpf/vtether";
 const STATE_DIR: &str = "/run/vtether";
+const DEFAULT_CONFIG_PATH: &str = "/etc/vtether/config.yaml";
+const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -31,6 +33,8 @@ enum Commands {
         #[command(subcommand)]
         action: ProxyAction,
     },
+    /// Install systemd unit file and default config
+    Setup,
 }
 
 #[derive(Subcommand)]
@@ -38,7 +42,7 @@ enum ProxyAction {
     /// Start forwarding with the given config
     Up {
         /// Path to YAML config file
-        #[arg(short, long)]
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
 
         /// bpffs pin path for persisting the eBPF program
@@ -61,6 +65,7 @@ struct Config {
     interface: String,
     /// IP address used as source in SNAT (auto-detected from interface if omitted)
     snat_ip: Option<String>,
+    #[serde(default)]
     routes: Vec<RouteConfig>,
 }
 
@@ -110,6 +115,7 @@ fn main() -> anyhow::Result<()> {
             ProxyAction::Up { config, pin_path } => proxy_up(config, pin_path),
             ProxyAction::Down { pin_path } => proxy_down(pin_path),
         },
+        Commands::Setup => setup(),
     }
 }
 
@@ -144,13 +150,119 @@ fn get_interface_ipv4(interface: &str) -> anyhow::Result<Ipv4Addr> {
     anyhow::bail!("no IPv4 address found on interface '{}'", interface)
 }
 
+fn get_default_interface() -> anyhow::Result<String> {
+    let output = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .context("failed to run `ip route`")?;
+    // Output like: "default via 192.168.1.1 dev eth0 proto ..."
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(idx) = parts.iter().position(|&p| p == "dev") {
+            if let Some(iface) = parts.get(idx + 1) {
+                return Ok(iface.to_string());
+            }
+        }
+    }
+    anyhow::bail!("no default route found")
+}
+
+fn setup() -> anyhow::Result<()> {
+    let vtether_bin = std::env::current_exe().context("failed to determine vtether binary path")?;
+    let vtether_bin = vtether_bin
+        .canonicalize()
+        .unwrap_or(vtether_bin);
+
+    let default_iface = get_default_interface().unwrap_or_else(|_| "eth0".to_string());
+
+    // Write default config
+    let config_dir = PathBuf::from(DEFAULT_CONFIG_PATH)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("failed to create {}", config_dir.display()))?;
+
+    if !PathBuf::from(DEFAULT_CONFIG_PATH).exists() {
+        let config_content = format!(
+            "\
+# vtether configuration
+# See: https://github.com/realityone/vtether
+
+# Network interface to attach XDP program to
+interface: {default_iface}
+
+# Source IP for SNAT (optional, auto-detected from interface)
+# snat_ip: \"192.168.1.100\"
+
+# Forwarding routes
+# routes:
+#   - protocol: tcp
+#     port: 443
+#     to: \"10.0.0.1:443\"
+#   - protocol: udp
+#     port: 53
+#     to: \"10.0.0.2:53\"
+"
+        );
+        std::fs::write(DEFAULT_CONFIG_PATH, &config_content)
+            .with_context(|| format!("failed to write {}", DEFAULT_CONFIG_PATH))?;
+        println!("  created {}", DEFAULT_CONFIG_PATH);
+    } else {
+        println!("  exists  {} (not overwritten)", DEFAULT_CONFIG_PATH);
+    }
+
+    // Write systemd unit file
+    let unit_content = format!(
+        "\
+[Unit]
+Description=vtether - eBPF/XDP port forwarder
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={bin} proxy up --config {config}
+ExecStop={bin} proxy down
+
+[Install]
+WantedBy=multi-user.target
+",
+        bin = vtether_bin.display(),
+        config = DEFAULT_CONFIG_PATH,
+    );
+    std::fs::write(SYSTEMD_UNIT_PATH, &unit_content)
+        .with_context(|| format!("failed to write {}", SYSTEMD_UNIT_PATH))?;
+    println!("  created {}", SYSTEMD_UNIT_PATH);
+
+    // Reload systemd
+    let status = std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .status()
+        .context("failed to run systemctl daemon-reload")?;
+    if !status.success() {
+        anyhow::bail!("systemctl daemon-reload failed");
+    }
+
+    println!("\nvtether setup complete.");
+    println!("  1. Edit {}", DEFAULT_CONFIG_PATH);
+    println!("  2. systemctl start vtether");
+    println!("  3. systemctl enable vtether  (optional, to start on boot)");
+
+    Ok(())
+}
+
 fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {}", config_path.display()))?;
     let config: Config =
         serde_yaml::from_str(&config_str).context("failed to parse config YAML")?;
 
-    anyhow::ensure!(!config.routes.is_empty(), "no routes defined in config");
+    if config.routes.is_empty() {
+        println!("vtether: no routes defined in {}, nothing to do", config_path.display());
+        return Ok(());
+    }
 
     let snat_ip: Ipv4Addr = match &config.snat_ip {
         Some(ip_str) => ip_str
