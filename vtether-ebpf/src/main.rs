@@ -76,7 +76,7 @@ pub struct NatKey {
 #[repr(C)]
 pub struct NatConfigEntry {
     pub dst_ip: u32,
-    pub this_ip: u32,
+    pub snat_ip: u32,
 }
 
 #[repr(C)]
@@ -90,7 +90,7 @@ pub struct ConntrackKey {
 
 #[repr(C)]
 pub struct ConntrackValue {
-    pub this_ip: u32,
+    pub snat_ip: u32,
     pub dst_ip: u32,
 }
 
@@ -106,7 +106,7 @@ pub struct ConntrackRevKey {
 #[repr(C)]
 pub struct ConntrackRevValue {
     pub client_ip: u32,
-    pub this_ip: u32,
+    pub snat_ip: u32,
 }
 
 // ---- Maps ----
@@ -246,7 +246,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     };
     if let Some(config) = unsafe { NAT_CONFIG.get(&nat_key) } {
         let new_dst = config.dst_ip;
-        let new_src = config.this_ip;
+        let new_src = config.snat_ip;
 
         // DNAT + SNAT
         write_field(unsafe { addr_of_mut!((*ip).dst_addr) }, new_dst);
@@ -269,7 +269,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
             _pad: [0; 3],
         };
         let fwd_val = ConntrackValue {
-            this_ip: config.this_ip,
+            snat_ip: config.snat_ip,
             dst_ip: config.dst_ip,
         };
         let _ = CONNTRACK_OUT.insert(&fwd_key, &fwd_val, 0);
@@ -283,7 +283,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         };
         let rev_val = ConntrackRevValue {
             client_ip: src_ip,
-            this_ip: config.this_ip,
+            snat_ip: config.snat_ip,
         };
         let _ = CONNTRACK_IN.insert(&rev_key, &rev_val, 0);
 
@@ -299,7 +299,7 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         _pad: [0; 3],
     };
     if let Some(rev) = unsafe { CONNTRACK_IN.get(&rev_key) } {
-        let new_src = rev.this_ip;
+        let new_src = rev.snat_ip;
         let new_dst = rev.client_ip;
 
         // Reverse SNAT + DNAT
