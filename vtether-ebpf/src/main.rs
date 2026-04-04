@@ -20,7 +20,6 @@ const ETH_HDR_LEN: usize = 14;
 const TCP_CSUM_OFF: usize = 16;
 // TCP flags offset within TCP header (byte containing FIN/SYN/RST/ACK)
 const TCP_FLAGS_OFF: usize = 13;
-const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 // UDP checksum offset within UDP header
 const UDP_CSUM_OFF: usize = 6;
@@ -484,11 +483,12 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
         update_route_stats(&nat_key, pkt_len, new_conn);
 
-        // Clean up conntrack on TCP FIN/RST
+        // Clean up conntrack on TCP RST (abrupt close only; FIN goes through
+        // the normal 4-way handshake so we must keep conntrack alive for it)
         if protocol == IPPROTO_TCP {
             if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
                 let flags = read_field(flags_ptr as *const u8);
-                if flags & (TCP_FIN | TCP_RST) != 0 {
+                if flags & TCP_RST != 0 {
                     let _ = CONNTRACK_OUT.remove(&fwd_key);
                     let rev_key = ConntrackRevKey {
                         dst_ip: new_dst_ip,
@@ -557,11 +557,12 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
         let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
         update_route_stats(&ret_nat_key, pkt_len, false);
 
-        // Clean up conntrack on TCP FIN/RST
+        // Clean up conntrack on TCP RST (abrupt close only; FIN goes through
+        // the normal 4-way handshake so we must keep conntrack alive for it)
         if protocol == IPPROTO_TCP {
             if let Ok(flags_ptr) = ptr_at::<u8>(ctx, transport_offset + TCP_FLAGS_OFF) {
                 let flags = read_field(flags_ptr as *const u8);
-                if flags & (TCP_FIN | TCP_RST) != 0 {
+                if flags & TCP_RST != 0 {
                     // Reconstruct forward key from reverse conntrack entry
                     let fwd_key = ConntrackKey {
                         client_ip: new_dst_ip,
