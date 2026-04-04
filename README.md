@@ -2,9 +2,9 @@
 
 eBPF/XDP-based TCP/UDP port forwarder with full NAT (DNAT + SNAT).
 
-## Build
+## Install
 
-Requires nightly Rust with `rust-src` and `bpf-linker`:
+Download a binary from [Releases](https://github.com/realityone/vtether/releases), or build from source:
 
 ```bash
 rustup default nightly
@@ -13,15 +13,21 @@ cargo +nightly install bpf-linker
 cargo build --release
 ```
 
-Or build via Docker:
+## Quick Start
 
 ```bash
-docker build -t vtether .
+# Install systemd service and default config
+vtether setup
+
+# Edit config
+vim /etc/vtether/config.yaml
+
+# Start / stop
+systemctl start vtether
+systemctl stop vtether
 ```
 
 ## Configuration
-
-Create a YAML config file (e.g. `vtether.yaml`):
 
 ```yaml
 interface: eth0
@@ -48,16 +54,21 @@ routes:
 
 ## Usage
 
-Start forwarding (requires root):
-
 ```bash
+# Start forwarding (requires root)
 vtether proxy up --config vtether.yaml
-```
 
-Stop forwarding:
-
-```bash
+# Stop forwarding
 vtether proxy down
+
+# Show active routes and metrics
+vtether inspect
+
+# Show version
+vtether version
 ```
 
-The XDP program is pinned to bpffs and persists after `vtether` exits. Kernel settings (`ip_forward`, `accept_local`) are configured automatically on `proxy up`.
+## Requirements
+
+- Linux with XDP-capable NIC driver and bpffs mounted at `/sys/fs/bpf`
+- Root privileges
