@@ -7,9 +7,13 @@ edition = "2024"
 name = "vtether-xdp-forward"
 path = "src/main.rs"
 
+[features]
+default = []
+debug-log = ["aya-log-ebpf"]
+
 [lints]
 workspace = true
 
 [dependencies]
 aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
+aya-log-ebpf = { version = "0.1", optional = true }

@@ -11,8 +11,20 @@ mod stats;
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::Array;
 use aya_ebpf::programs::XdpContext;
-use aya_log_ebpf::info;
 use core::ptr::addr_of;
+
+/// Compile-time conditional log. Emits eBPF perf-buffer log only when
+/// the `debug-log` feature is enabled. Completely eliminated at compile
+/// time otherwise — zero overhead in production.
+///
+/// Build with debug logging:
+///   cargo build --release --features vtether-xdp/debug-log
+macro_rules! dbg_log {
+    ($ctx:expr, $($arg:tt)*) => {
+        #[cfg(feature = "debug-log")]
+        aya_log_ebpf::info!($ctx, $($arg)*);
+    };
+}
 
 use conntrack::{
     ct_create4, ct_lazy_lookup4, CtState, CtStatus, Ipv4CtTuple, CT_EGRESS, CT_INGRESS,
@@ -87,24 +99,24 @@ fn handle_forward(
         match ct_lazy_lookup4(tcp_flags, &fwd_tuple, CT_SERVICE, &mut ct_state) {
             CtStatus::New => {
                 if svc.count == 0 {
-                    info!(ctx, "FWD: no backends");
+                    dbg_log!(ctx, "FWD: no backends");
                     stats::update_route_drops(svc.rev_nat_index);
                     return Ok(drop);
                 }
                 let backend_id = lb4_select_backend_id(key, svc);
                 if backend_id == 0 {
-                    info!(ctx, "FWD: backend select failed");
+                    dbg_log!(ctx, "FWD: backend select failed");
                     stats::update_route_drops(svc.rev_nat_index);
                     return Ok(drop);
                 }
                 ct_state.backend_id = backend_id;
                 if ct_create4(&fwd_tuple, &ct_state).is_err() {
-                    info!(ctx, "FWD: ct_create4 failed");
+                    dbg_log!(ctx, "FWD: ct_create4 failed");
                     stats::update_route_drops(svc.rev_nat_index);
                     return Ok(drop);
                 }
                 // Log only new connections (not per-packet)
-                info!(ctx, "FWD: NEW conn, backend_id={}", backend_id);
+                dbg_log!(ctx, "FWD: NEW conn, backend_id={}", backend_id);
                 (backend_id, true)
             }
             CtStatus::Established | CtStatus::Reply => {
