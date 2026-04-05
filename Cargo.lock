@@ -868,14 +868,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vtether-xdp"
-version = "0.1.0"
-dependencies = [
- "aya-ebpf",
- "aya-log-ebpf",
-]
-
-[[package]]
 name = "vtether-xdp2"
 version = "0.1.0"
 dependencies = [

@@ -1,5 +1,5 @@
 [workspace]
-members = ["vtether-ebpf", "vtether-xdp", "vtether-xdp2"]
+members = ["vtether-ebpf", "vtether-xdp2"]
 default-members = ["."]
 
 [package]
