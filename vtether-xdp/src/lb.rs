@@ -3,7 +3,6 @@
 /// Cilium equivalents:
 /// - `bpf/lib/lb.h` -- `lb4_lookup_service()`, `lb4_select_backend_id()`,
 ///   `lb4_lookup_backend()`, `lb4_xlate()`, `lb_l4_xlate()`, `lb4_rev_nat()`
-
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::HashMap;
 use aya_ebpf::programs::XdpContext;
@@ -11,7 +10,9 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use crate::conntrack::Ipv4CtTuple;
 use crate::csum::{csum_replace2, csum_replace4};
-use crate::parse::{ptr_at, read_field, write_field, Ipv4Hdr, TCP_CSUM_OFF, TCP_DPORT_OFF, TCP_SPORT_OFF};
+use crate::parse::{
+    Ipv4Hdr, TCP_CSUM_OFF, TCP_DPORT_OFF, TCP_SPORT_OFF, ptr_at, read_field, write_field,
+};
 
 // ---- Service lookup types ----
 

@@ -428,10 +428,9 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         .routes
         .iter()
         .map(|r| {
-            let to: SocketAddrV4 = r
-                .to
-                .parse()
-                .with_context(|| format!("invalid 'to' address: {}", r.to))?;
+            let to: SocketAddrV4 =
+                r.to.parse()
+                    .with_context(|| format!("invalid 'to' address: {}", r.to))?;
             Ok((r.port, to))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -463,20 +462,45 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         // LB4_SERVICES: slot 0 (service descriptor) + slot 1 (backend ref)
         {
             let mut svc_map: HashMap<_, Lb4Key, Lb4Service> = HashMap::try_from(
-                ebpf.map_mut("LB4_SERVICES").context("LB4_SERVICES not found")?,
+                ebpf.map_mut("LB4_SERVICES")
+                    .context("LB4_SERVICES not found")?,
             )?;
             svc_map.insert(
-                Lb4Key { address: snat_ip_be, dport: listen_port_be, backend_slot: 0,
-                         proto: IPPROTO_TCP, scope: 0, _pad: [0; 2] },
-                Lb4Service { backend_id: 0, count: 1, rev_nat_index,
-                             flags: 0, flags2: 0, _pad: 0 },
+                Lb4Key {
+                    address: snat_ip_be,
+                    dport: listen_port_be,
+                    backend_slot: 0,
+                    proto: IPPROTO_TCP,
+                    scope: 0,
+                    _pad: [0; 2],
+                },
+                Lb4Service {
+                    backend_id: 0,
+                    count: 1,
+                    rev_nat_index,
+                    flags: 0,
+                    flags2: 0,
+                    _pad: 0,
+                },
                 0,
             )?;
             svc_map.insert(
-                Lb4Key { address: snat_ip_be, dport: listen_port_be, backend_slot: 1,
-                         proto: IPPROTO_TCP, scope: 0, _pad: [0; 2] },
-                Lb4Service { backend_id, count: 0, rev_nat_index,
-                             flags: 0, flags2: 0, _pad: 0 },
+                Lb4Key {
+                    address: snat_ip_be,
+                    dport: listen_port_be,
+                    backend_slot: 1,
+                    proto: IPPROTO_TCP,
+                    scope: 0,
+                    _pad: [0; 2],
+                },
+                Lb4Service {
+                    backend_id,
+                    count: 0,
+                    rev_nat_index,
+                    flags: 0,
+                    flags2: 0,
+                    _pad: 0,
+                },
                 0,
             )?;
         }
@@ -484,12 +508,17 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         // LB4_BACKENDS
         {
             let mut be_map: HashMap<_, u32, Lb4Backend> = HashMap::try_from(
-                ebpf.map_mut("LB4_BACKENDS").context("LB4_BACKENDS not found")?,
+                ebpf.map_mut("LB4_BACKENDS")
+                    .context("LB4_BACKENDS not found")?,
             )?;
             be_map.insert(
                 backend_id,
-                Lb4Backend { address: backend_ip_be, port: backend_port_be,
-                             proto: IPPROTO_TCP, flags: 0 },
+                Lb4Backend {
+                    address: backend_ip_be,
+                    port: backend_port_be,
+                    proto: IPPROTO_TCP,
+                    flags: 0,
+                },
                 0,
             )?;
         }
@@ -497,11 +526,16 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         // LB4_REVERSE_NAT
         {
             let mut rev_map: HashMap<_, u16, Lb4ReverseNat> = HashMap::try_from(
-                ebpf.map_mut("LB4_REVERSE_NAT").context("LB4_REVERSE_NAT not found")?,
+                ebpf.map_mut("LB4_REVERSE_NAT")
+                    .context("LB4_REVERSE_NAT not found")?,
             )?;
             rev_map.insert(
                 rev_nat_index,
-                Lb4ReverseNat { address: snat_ip_be, port: listen_port_be, _pad: 0 },
+                Lb4ReverseNat {
+                    address: snat_ip_be,
+                    port: listen_port_be,
+                    _pad: 0,
+                },
                 0,
             )?;
         }
@@ -509,8 +543,10 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
 
     // Populate SNAT_CONFIG
     {
-        let mut snat_map: Array<_, SnatConfig> =
-            Array::try_from(ebpf.map_mut("SNAT_CONFIG").context("SNAT_CONFIG not found")?)?;
+        let mut snat_map: Array<_, SnatConfig> = Array::try_from(
+            ebpf.map_mut("SNAT_CONFIG")
+                .context("SNAT_CONFIG not found")?,
+        )?;
         snat_map.set(
             0,
             SnatConfig {
@@ -708,7 +744,11 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     let ct4_path = pin_path.join("ct4");
     let snat4_path = pin_path.join("snat4");
     if !ct4_path.exists() {
-        return Ok(GcResult { total: 0, expired: 0, orphans: 0 });
+        return Ok(GcResult {
+            total: 0,
+            expired: 0,
+            orphans: 0,
+        });
     }
 
     let map_data = MapData::from_pin(&ct4_path).context("failed to load pinned CT4")?;
@@ -732,7 +772,11 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     }
 
     if !expired_keys.is_empty() {
-        info!("gc: removing {} expired CT entries (total: {})", expired_keys.len(), total);
+        info!(
+            "gc: removing {} expired CT entries (total: {})",
+            expired_keys.len(),
+            total
+        );
     }
     for key in &expired_keys {
         let _ = ct4.remove(key);
@@ -775,10 +819,10 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
                     TUPLE_F_IN => {
                         // Reverse SNAT -> check if reverse CT entry exists
                         Ipv4CtTuple {
-                            daddr: snat_val.to_addr,   // client_ip
-                            saddr: snat_key.daddr,     // backend_ip
-                            dport: snat_val.to_port,   // client_port
-                            sport: snat_key.dport,     // backend_port
+                            daddr: snat_val.to_addr, // client_ip
+                            saddr: snat_key.daddr,   // backend_ip
+                            dport: snat_val.to_port, // client_port
+                            sport: snat_key.dport,   // backend_port
                             nexthdr: IPPROTO_TCP,
                             flags: 0, // CT_EGRESS (the reverse CT entry created on forward path)
                         }
@@ -788,10 +832,10 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
                         // If the reverse SNAT entry is gone, this forward entry is orphaned too.
                         // Use the reverse SNAT key to check.
                         Ipv4CtTuple {
-                            saddr: snat_val.to_addr,   // snat_ip
-                            daddr: snat_key.daddr,     // backend_ip
-                            sport: snat_val.to_port,   // snat_port
-                            dport: snat_key.dport,     // backend_port
+                            saddr: snat_val.to_addr, // snat_ip
+                            daddr: snat_key.daddr,   // backend_ip
+                            sport: snat_val.to_port, // snat_port
+                            dport: snat_key.dport,   // backend_port
                             nexthdr: IPPROTO_TCP,
                             flags: TUPLE_F_IN,
                         }
@@ -860,7 +904,10 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
     let _ = std::fs::remove_dir(&pin_path);
     let _ = std::fs::remove_dir_all(&state_dir);
 
-    println!("vtether: proxy destroy (detached from {})", interface.trim());
+    println!(
+        "vtether: proxy destroy (detached from {})",
+        interface.trim()
+    );
 
     Ok(())
 }
@@ -895,9 +942,9 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
     let _rev_path = pin_path.join("lb4_reverse_nat");
 
     if svc_path.exists() && be_path.exists() {
-        let svc_map: HashMap<_, Lb4Key, Lb4Service> = HashMap::try_from(
-            Map::HashMap(MapData::from_pin(&svc_path).context("failed to load LB4_SERVICES")?),
-        )?;
+        let svc_map: HashMap<_, Lb4Key, Lb4Service> = HashMap::try_from(Map::HashMap(
+            MapData::from_pin(&svc_path).context("failed to load LB4_SERVICES")?,
+        ))?;
         let be_map: HashMap<_, u32, Lb4Backend> = HashMap::try_from(Map::HashMap(
             MapData::from_pin(&be_path).context("failed to load LB4_BACKENDS")?,
         ))?;

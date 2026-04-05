@@ -16,7 +16,6 @@
 /// - SYN-only (handshake): `CT_SYN_TIMEOUT` (60s)
 /// - Non-SYN seen (`seen_non_syn`): `CT_CONNECTION_LIFETIME_TCP` (6h)
 /// - After FIN/RST (`closing`): `CT_CLOSE_TIMEOUT` (10s)
-
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::HashMap;
 

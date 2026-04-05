@@ -148,30 +148,83 @@ async fn main() -> anyhow::Result<()> {
     let mut svc: HashMap<_, Lb4Key, Lb4Service> =
         HashMap::try_from(ebpf.map_mut("LB4_SERVICES").context("map")?)?;
     svc.insert(
-        Lb4Key { address: vip_be, dport: listen_port_be, backend_slot: 0, proto: 6, scope: 0, _pad: [0; 2] },
-        Lb4Service { backend_id: 0, count: 1, rev_nat_index: 1, flags: 0, flags2: 0, _pad: 0 },
+        Lb4Key {
+            address: vip_be,
+            dport: listen_port_be,
+            backend_slot: 0,
+            proto: 6,
+            scope: 0,
+            _pad: [0; 2],
+        },
+        Lb4Service {
+            backend_id: 0,
+            count: 1,
+            rev_nat_index: 1,
+            flags: 0,
+            flags2: 0,
+            _pad: 0,
+        },
         0,
     )?;
     svc.insert(
-        Lb4Key { address: vip_be, dport: listen_port_be, backend_slot: 1, proto: 6, scope: 0, _pad: [0; 2] },
-        Lb4Service { backend_id: 1, count: 0, rev_nat_index: 1, flags: 0, flags2: 0, _pad: 0 },
+        Lb4Key {
+            address: vip_be,
+            dport: listen_port_be,
+            backend_slot: 1,
+            proto: 6,
+            scope: 0,
+            _pad: [0; 2],
+        },
+        Lb4Service {
+            backend_id: 1,
+            count: 0,
+            rev_nat_index: 1,
+            flags: 0,
+            flags2: 0,
+            _pad: 0,
+        },
         0,
     )?;
 
     // LB4_BACKENDS: id=1
     let mut be: HashMap<_, u32, Lb4Backend> =
         HashMap::try_from(ebpf.map_mut("LB4_BACKENDS").context("map")?)?;
-    be.insert(1u32, Lb4Backend { address: backend_ip_be, port: backend_port_be, proto: 6, flags: 0 }, 0)?;
+    be.insert(
+        1u32,
+        Lb4Backend {
+            address: backend_ip_be,
+            port: backend_port_be,
+            proto: 6,
+            flags: 0,
+        },
+        0,
+    )?;
 
     // LB4_REVERSE_NAT: index=1
     let mut rev: HashMap<_, u16, Lb4ReverseNat> =
         HashMap::try_from(ebpf.map_mut("LB4_REVERSE_NAT").context("map")?)?;
-    rev.insert(1u16, Lb4ReverseNat { address: vip_be, port: listen_port_be, _pad: 0 }, 0)?;
+    rev.insert(
+        1u16,
+        Lb4ReverseNat {
+            address: vip_be,
+            port: listen_port_be,
+            _pad: 0,
+        },
+        0,
+    )?;
 
     // SNAT_CONFIG
     let mut snat: Array<_, SnatConfig> =
         Array::try_from(ebpf.map_mut("SNAT_CONFIG").context("map")?)?;
-    snat.set(0, SnatConfig { snat_addr: vip_be, min_port: 32768, max_port: 60999 }, 0)?;
+    snat.set(
+        0,
+        SnatConfig {
+            snat_addr: vip_be,
+            min_port: 32768,
+            max_port: 60999,
+        },
+        0,
+    )?;
 
     info!("ready — Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;

@@ -2,7 +2,6 @@
 ///
 /// Uses per-CPU maps for lock-free concurrent updates.
 /// Keyed by `rev_nat_index` (stable service identity).
-
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::PerCpuHashMap;
 
@@ -63,7 +62,12 @@ pub fn update_route_drops(rev_nat_index: u16) {
     match ROUTE_STATS.get_ptr_mut(&key) {
         Some(stats) => unsafe { (*stats).drops += 1 },
         None => {
-            let stats = RouteStats { connections: 0, packets: 0, bytes: 0, drops: 1 };
+            let stats = RouteStats {
+                connections: 0,
+                packets: 0,
+                bytes: 0,
+                drops: 1,
+            };
             let _ = ROUTE_STATS.insert(&key, &stats, 0);
         }
     }

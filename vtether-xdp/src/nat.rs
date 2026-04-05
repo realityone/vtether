@@ -3,7 +3,6 @@
 /// Cilium equivalents:
 /// - `bpf/lib/nat.h` -- `__snat_v4_nat()`, `snat_v4_new_mapping()`,
 ///   `snat_v4_rewrite_headers()`, `snat_v4_rev_nat()`
-
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::HashMap;
 use aya_ebpf::programs::XdpContext;
@@ -12,8 +11,8 @@ use core::ptr::{addr_of, addr_of_mut};
 use crate::conntrack::Ipv4CtTuple;
 use crate::csum::{csum_replace2, csum_replace4};
 use crate::parse::{
-    ptr_at, read_field, write_field, Ipv4Hdr, IPPROTO_TCP, TCP_CSUM_OFF, TCP_DPORT_OFF,
-    TCP_SPORT_OFF,
+    IPPROTO_TCP, Ipv4Hdr, TCP_CSUM_OFF, TCP_DPORT_OFF, TCP_SPORT_OFF, ptr_at, read_field,
+    write_field,
 };
 
 /// Maximum SNAT port allocation retries.
@@ -193,7 +192,15 @@ pub fn snat_v4_nat(
         snat_v4_new_mapping(client_ip, backend_ip, client_port, backend_port, target)?
     };
 
-    snat_v4_rewrite_egress(ctx, ip, l4_off, client_ip, target.addr, client_port, snat_port)?;
+    snat_v4_rewrite_egress(
+        ctx,
+        ip,
+        l4_off,
+        client_ip,
+        target.addr,
+        client_port,
+        snat_port,
+    )?;
 
     Ok(snat_port)
 }

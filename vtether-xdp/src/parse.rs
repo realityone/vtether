@@ -4,7 +4,6 @@
 /// Simplified from vtether-xdp: requires IHL==5 (no IP options), so L4_OFF=34
 /// is constant. A single bounds check of `data + 54 <= data_end` upfront
 /// satisfies the eBPF verifier.
-
 use aya_ebpf::programs::XdpContext;
 use core::mem;
 use core::ptr::addr_of;

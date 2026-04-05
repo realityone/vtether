@@ -57,12 +57,11 @@ macro_rules! debug_trace {
 }
 
 use conntrack::{
-    ct_create4, ct_lazy_lookup4, CtState, CtStatus, Ipv4CtTuple, CT_EGRESS, CT_INGRESS,
-    CT_SERVICE,
+    CT_EGRESS, CT_INGRESS, CT_SERVICE, CtState, CtStatus, Ipv4CtTuple, ct_create4, ct_lazy_lookup4,
 };
-use lb::{lb4_fill_key, lb4_lookup_backend, lb4_lookup_service, lb4_select_backend_id, Lb4Key};
+use lb::{Lb4Key, lb4_fill_key, lb4_lookup_backend, lb4_lookup_service, lb4_select_backend_id};
 use nat::SnatTarget;
-use parse::{load_tcp_flags, read_field, Ipv4Hdr, IPPROTO_TCP};
+use parse::{IPPROTO_TCP, Ipv4Hdr, load_tcp_flags, read_field};
 
 #[repr(C)]
 pub struct SnatConfig {
@@ -94,7 +93,12 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     let mut key = Lb4Key {
-        address: 0, dport: 0, backend_slot: 0, proto: 0, scope: 0, _pad: [0; 2],
+        address: 0,
+        dport: 0,
+        backend_slot: 0,
+        proto: 0,
+        scope: 0,
+        _pad: [0; 2],
     };
     lb4_fill_key(&mut key, &tuple);
 
@@ -117,9 +121,12 @@ fn handle_forward(
     let drop = aya_ebpf::bindings::xdp_action::XDP_DROP;
 
     let fwd_tuple = Ipv4CtTuple {
-        daddr: orig_tuple.daddr, saddr: orig_tuple.saddr,
-        dport: orig_tuple.dport, sport: orig_tuple.sport,
-        nexthdr: IPPROTO_TCP, flags: CT_EGRESS | CT_SERVICE,
+        daddr: orig_tuple.daddr,
+        saddr: orig_tuple.saddr,
+        dport: orig_tuple.dport,
+        sport: orig_tuple.sport,
+        nexthdr: IPPROTO_TCP,
+        flags: CT_EGRESS | CT_SERVICE,
     };
 
     let mut ct_state = CtState::new();
@@ -166,27 +173,50 @@ fn handle_forward(
     let old_sport = orig_tuple.sport;
 
     // DNAT
-    lb::lb4_xlate_dnat(ctx, ip, l4_off, old_daddr, backend.address, old_dport, backend.port)?;
+    lb::lb4_xlate_dnat(
+        ctx,
+        ip,
+        l4_off,
+        old_daddr,
+        backend.address,
+        old_dport,
+        backend.port,
+    )?;
     debug_debug!(ctx, "FWD: DNAT done");
 
     // Reverse CT entry for reply path
     let rev_ct_tuple = Ipv4CtTuple {
-        daddr: old_saddr, saddr: backend.address,
-        dport: old_sport, sport: backend.port,
-        nexthdr: IPPROTO_TCP, flags: CT_EGRESS,
+        daddr: old_saddr,
+        saddr: backend.address,
+        dport: old_sport,
+        sport: backend.port,
+        nexthdr: IPPROTO_TCP,
+        flags: CT_EGRESS,
     };
     let rev_ct_state = CtState {
-        rev_nat_index: svc.rev_nat_index, backend_id, closing: false, syn: false,
+        rev_nat_index: svc.rev_nat_index,
+        backend_id,
+        closing: false,
+        syn: false,
     };
     let _ = ct_create4(&rev_ct_tuple, &rev_ct_state);
 
     // SNAT
     let snat_cfg = SNAT_CONFIG.get(0).ok_or(())?;
     let target = SnatTarget {
-        addr: snat_cfg.snat_addr, min_port: snat_cfg.min_port, max_port: snat_cfg.max_port,
+        addr: snat_cfg.snat_addr,
+        min_port: snat_cfg.min_port,
+        max_port: snat_cfg.max_port,
     };
     let snat_port = nat::snat_v4_nat(
-        ctx, ip, l4_off, old_saddr, old_sport, backend.address, backend.port, &target,
+        ctx,
+        ip,
+        l4_off,
+        old_saddr,
+        old_sport,
+        backend.address,
+        backend.port,
+        &target,
     )?;
     debug_debug!(ctx, "FWD: SNAT done, port=0x{:x}", snat_port);
 
@@ -217,9 +247,12 @@ fn handle_reply(
         read_field(parse::ptr_at::<u16>(ctx, l4_off + parse::TCP_SPORT_OFF)? as *const u16);
 
     let rev_lookup_tuple = Ipv4CtTuple {
-        daddr: client_ip, saddr: backend_ip,
-        dport: client_port, sport: backend_port,
-        nexthdr: IPPROTO_TCP, flags: CT_EGRESS,
+        daddr: client_ip,
+        saddr: backend_ip,
+        dport: client_port,
+        sport: backend_port,
+        nexthdr: IPPROTO_TCP,
+        flags: CT_EGRESS,
     };
 
     let mut ct_state = CtState::new();
@@ -229,7 +262,11 @@ fn handle_reply(
             return Ok(pass);
         }
         CtStatus::Established | CtStatus::Reply => {
-            debug_debug!(ctx, "REPLY: CT hit, rev_nat_index={}", ct_state.rev_nat_index);
+            debug_debug!(
+                ctx,
+                "REPLY: CT hit, rev_nat_index={}",
+                ct_state.rev_nat_index
+            );
         }
     }
 
