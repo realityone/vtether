@@ -13,9 +13,8 @@ use crate::{
         IPPROTO_TCP, GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS,
         adapt_gc_interval, reap_conntrack,
     },
-    get_interface_ipv4,
+    helper::{get_interface_ipv4, state_dir_for},
     setup::setup_sysctl,
-    state_dir_for,
 };
 
 // ---- Map pin names ----

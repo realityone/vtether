@@ -5,6 +5,7 @@ use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
 
 use crate::{
     gc::{CtEntry, Ipv4CtTuple, SnatEntry, ktime_get_ns},
+    helper::state_dir_for,
     proxy::{Lb4Backend, Lb4Key, Lb4Service},
 };
 
@@ -37,7 +38,7 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
         prog_pin.display()
     );
 
-    let state_dir = crate::state_dir_for(pin_path);
+    let state_dir = state_dir_for(pin_path);
     let interface = std::fs::read_to_string(state_dir.join("interface"))
         .unwrap_or_else(|_| "unknown".to_string());
     println!("vtether: attached to {}", interface.trim());
