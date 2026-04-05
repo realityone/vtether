@@ -1,10 +1,10 @@
 [package]
-name = "vtether-ebpf"
+name = "vtether-xdp"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "vtether-forward"
+name = "vtether-xdp-forward"
 path = "src/main.rs"
 
 [lints]

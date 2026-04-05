@@ -1,26 +1,6 @@
 [workspace]
-members = ["vtether-ebpf", "vtether-xdp2"]
-default-members = ["."]
-
-[package]
-name = "vtether"
-version = "0.0.0"
-edition = "2024"
-
-[dependencies]
-aya = "0.13"
-aya-log = "0.2"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-env_logger = "0.11"
-log = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-nix = { version = "0.30", features = ["net", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
-
-[build-dependencies]
-aya-build = "0.1"
+members = ["vtether-xdp", "vtether-cli"]
+default-members = ["vtether-cli"]
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
@@ -37,9 +17,6 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 wildcard_imports = "allow"
 inline_always = "allow"
-
-[lints]
-workspace = true
 
 [profile.dev]
 opt-level = 2

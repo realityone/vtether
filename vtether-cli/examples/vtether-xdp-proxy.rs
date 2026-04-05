@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
-        "/vtether-xdp2-forward"
+        "/vtether-xdp-forward"
     )))?;
 
     let program: &mut Xdp = ebpf

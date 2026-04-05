@@ -96,7 +96,7 @@ struct RouteConfig {
     to: String,
 }
 
-// ---- BPF map types (must match vtether-xdp2 eBPF layout exactly) ----
+// ---- BPF map types (must match vtether-xdp eBPF layout exactly) ----
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -442,13 +442,13 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         anyhow::ensure!(seen.insert(*port), "duplicate route: tcp/{}", port);
     }
 
-    // Load vtether-xdp2 eBPF with configurable conntrack map size
+    // Load vtether-xdp eBPF with configurable conntrack map size
     let mut ebpf = aya::EbpfLoader::new()
         .set_max_entries("CT4", config.conntrack_size)
         .set_max_entries("SNAT4", config.conntrack_size)
         .load(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
-            "/vtether-xdp2-forward"
+            "/vtether-xdp-forward"
         )))
         .context("failed to load eBPF bytecode")?;
 
