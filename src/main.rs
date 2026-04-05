@@ -15,27 +15,21 @@ const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
 const STATE_BASE_DIR: &str = "/run/vtether";
 
 const IPPROTO_TCP: u8 = 6;
-const IPPROTO_UDP: u8 = 17;
-
-// Conntrack reaper interval
-const REAP_INTERVAL_SECS: u64 = 120;
-
-// State-based timeouts matching Linux nf_conntrack patterns
-const TCP_TIMEOUT_SYN_SENT: u64 = 120;
-const TCP_TIMEOUT_ESTABLISHED: u64 = 432_000; // 5 days
-const TCP_TIMEOUT_FIN_WAIT: u64 = 120;
-const TCP_TIMEOUT_CLOSE: u64 = 10;
-const UDP_TIMEOUT: u64 = 180;
 
 // tcp_state bitfield (must match eBPF)
 const TCP_STATE_ESTABLISHED: u8 = 0x01;
 const TCP_STATE_FIN_CLIENT: u8 = 0x02;
 const TCP_STATE_FIN_SERVER: u8 = 0x04;
 
+// Adaptive GC interval bounds
+const GC_INTERVAL_MIN_SECS: u64 = 10;
+const GC_INTERVAL_MAX_SECS: u64 = 300;
+const GC_INTERVAL_DEFAULT_SECS: u64 = 30;
+
 // ---- CLI ----
 
 #[derive(Parser)]
-#[command(name = "vtether", about = "eBPF-based TCP/UDP port forwarder (XDP)")]
+#[command(name = "vtether", about = "eBPF-based TCP port forwarder (XDP)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -101,14 +95,8 @@ fn default_conntrack_size() -> u32 {
     65536
 }
 
-fn default_protocol() -> String {
-    "tcp".to_string()
-}
-
 #[derive(Debug, Deserialize)]
 struct RouteConfig {
-    #[serde(default = "default_protocol")]
-    protocol: String,
     port: u16,
     to: String,
 }
@@ -153,7 +141,7 @@ unsafe impl aya::Pod for ConntrackKey {}
 struct ConntrackValue {
     snat_ip: u32,
     dst_ip: u32,
-    last_seen_ns: u64,
+    lifetime: u64,
     orig_dst_port: u16,
     new_dst_port: u16,
     snat_port: u16,
@@ -239,22 +227,6 @@ fn print_version() {
     );
 }
 
-fn parse_protocol(s: &str) -> anyhow::Result<u8> {
-    match s {
-        "tcp" => Ok(IPPROTO_TCP),
-        "udp" => Ok(IPPROTO_UDP),
-        other => anyhow::bail!("unsupported protocol '{}' (expected 'tcp' or 'udp')", other),
-    }
-}
-
-fn protocol_name(proto: u8) -> &'static str {
-    match proto {
-        IPPROTO_TCP => "tcp",
-        IPPROTO_UDP => "udp",
-        _ => "unknown",
-    }
-}
-
 fn get_interface_ipv4(interface: &str) -> anyhow::Result<Ipv4Addr> {
     let addrs = nix::ifaddrs::getifaddrs().context("failed to enumerate interface addresses")?;
     for ifaddr in addrs {
@@ -316,14 +288,12 @@ interface: {default_iface}
 # Max conntrack entries (default: 65536)
 # conntrack_size: 65536
 
-# Forwarding routes
+# TCP forwarding routes
 # routes:
-#   - protocol: tcp    # tcp or udp (default: tcp)
-#     port: 443
+#   - port: 443
 #     to: \"10.0.0.1:443\"
-#   - protocol: udp
-#     port: 53
-#     to: \"10.0.0.2:53\"
+#   - port: 8080
+#     to: \"10.0.0.2:80\"
 "
         );
         std::fs::write(DEFAULT_CONFIG_PATH, &config_content)
@@ -425,27 +395,24 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     let snat_ip_be = u32::from(snat_ip).to_be();
 
     // Parse all routes upfront
-    let parsed_routes: Vec<(u16, SocketAddrV4, u8)> = config
+    let parsed_routes: Vec<(u16, SocketAddrV4)> = config
         .routes
         .iter()
         .map(|r| {
-            let proto = parse_protocol(&r.protocol)
-                .with_context(|| format!("in route :{} -> {}", r.port, r.to))?;
             let to: SocketAddrV4 = r
                 .to
                 .parse()
                 .with_context(|| format!("invalid 'to' address: {}", r.to))?;
-            Ok((r.port, to, proto))
+            Ok((r.port, to))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Check for duplicate (port, protocol) pairs
+    // Check for duplicate ports
     let mut seen = std::collections::HashSet::new();
-    for (port, _, proto) in &parsed_routes {
+    for (port, _) in &parsed_routes {
         anyhow::ensure!(
-            seen.insert((*port, *proto)),
-            "duplicate route: {}/{}",
-            protocol_name(*proto),
+            seen.insert(*port),
+            "duplicate route: tcp/{}",
             port
         );
     }
@@ -465,10 +432,10 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         let mut nat_config: HashMap<_, NatKey, NatConfigEntry> =
             HashMap::try_from(ebpf.map_mut("NAT_CONFIG").context("NAT_CONFIG map not found")?)?;
 
-        for (port, to, proto) in &parsed_routes {
+        for (port, to) in &parsed_routes {
             let key = NatKey {
                 port: *port,
-                protocol: *proto,
+                protocol: IPPROTO_TCP,
                 _pad: 0,
             };
             let entry = NatConfigEntry {
@@ -558,24 +525,38 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         "vtether: proxy up (xdp on {}, snat_ip: {}, conntrack: {})",
         config.interface, snat_ip, config.conntrack_size
     );
-    for (port, to, proto) in &parsed_routes {
-        println!("  {} :{} -> {}", protocol_name(*proto), port, to);
-        info!("route: {} :{} -> {}", protocol_name(*proto), port, to);
+    for (port, to) in &parsed_routes {
+        println!("  tcp :{} -> {}", port, to);
+        info!("route: tcp :{} -> {}", port, to);
     }
 
-    // Spawn conntrack reaper task
+    // Spawn conntrack GC task with adaptive interval
     let reaper_pin_path = pin_path.clone();
     let reaper_handle = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(REAP_INTERVAL_SECS));
+        let mut gc_interval_secs = GC_INTERVAL_DEFAULT_SECS;
         info!(
-            "conntrack reaper started (interval: {}s, timeouts: syn_sent={}s established={}s fin_wait={}s close={}s udp={}s)",
-            REAP_INTERVAL_SECS, TCP_TIMEOUT_SYN_SENT, TCP_TIMEOUT_ESTABLISHED, TCP_TIMEOUT_FIN_WAIT, TCP_TIMEOUT_CLOSE, UDP_TIMEOUT,
+            "conntrack gc started (initial interval: {}s, bounds: {}s-{}s)",
+            gc_interval_secs, GC_INTERVAL_MIN_SECS, GC_INTERVAL_MAX_SECS,
         );
         loop {
-            interval.tick().await;
-            if let Err(e) = reap_conntrack(&reaper_pin_path) {
-                log::warn!("conntrack reaper error: {:#}", e);
+            tokio::time::sleep(std::time::Duration::from_secs(gc_interval_secs)).await;
+            match reap_conntrack(&reaper_pin_path) {
+                Ok(result) => {
+                    if result.expired > 0 || result.orphans > 0 {
+                        info!(
+                            "gc cycle: total={} expired={} orphans={} next_interval={}s",
+                            result.total,
+                            result.expired,
+                            result.orphans,
+                            adapt_gc_interval(gc_interval_secs, result.total, result.expired),
+                        );
+                    }
+                    gc_interval_secs =
+                        adapt_gc_interval(gc_interval_secs, result.total, result.expired);
+                }
+                Err(e) => {
+                    log::warn!("conntrack gc error: {:#}", e);
+                }
             }
         }
     });
@@ -609,39 +590,50 @@ fn ktime_get_ns() -> u64 {
     ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
 }
 
-fn tcp_state_info(tcp_state: u8) -> (&'static str, u64) {
+fn conntrack_state_name(tcp_state: u8) -> &'static str {
     let est = tcp_state & TCP_STATE_ESTABLISHED != 0;
-    let fin_c = tcp_state & TCP_STATE_FIN_CLIENT != 0;
-    let fin_s = tcp_state & TCP_STATE_FIN_SERVER != 0;
-    match (est, fin_c, fin_s) {
-        (false, _, _) => ("SYN_SENT", TCP_TIMEOUT_SYN_SENT),
-        (true, false, false) => ("ESTABLISHED", TCP_TIMEOUT_ESTABLISHED),
-        (true, true, true) => ("CLOSE", TCP_TIMEOUT_CLOSE),
-        (true, _, _) => ("FIN_WAIT", TCP_TIMEOUT_FIN_WAIT),
+    let fin = tcp_state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER) != 0;
+    match (est, fin) {
+        (false, _) => "SYN_SENT",
+        (true, false) => "ESTABLISHED",
+        (true, true) => "CLOSING",
     }
 }
 
-/// Return the timeout in nanoseconds for a conntrack entry based on protocol and TCP state.
-fn conntrack_timeout_ns(protocol: u8, tcp_state: u8) -> u64 {
-    let secs = match protocol {
-        IPPROTO_TCP => tcp_state_info(tcp_state).1,
-        _ => UDP_TIMEOUT,
+struct GcResult {
+    total: u64,
+    expired: u64,
+    orphans: u64,
+}
+
+/// Adapt the GC interval based on the deletion ratio from the last cycle.
+/// Inspired by Cilium's adaptive CT GC interval:
+///   >25% expired → halve interval (more pressure, scan faster)
+///   <5% expired  → 1.5x interval (less pressure, scan slower)
+fn adapt_gc_interval(current_secs: u64, total: u64, expired: u64) -> u64 {
+    if total == 0 {
+        return current_secs;
+    }
+    let ratio = expired * 100 / total;
+    let new_secs = if ratio > 25 {
+        current_secs / 2
+    } else if ratio < 5 {
+        current_secs * 3 / 2
+    } else {
+        current_secs
     };
-    secs * 1_000_000_000
+    new_secs.clamp(GC_INTERVAL_MIN_SECS, GC_INTERVAL_MAX_SECS)
 }
 
-fn conntrack_state_name(protocol: u8, tcp_state: u8) -> &'static str {
-    match protocol {
-        IPPROTO_TCP => tcp_state_info(tcp_state).0,
-        _ => "ACTIVE",
-    }
-}
-
-fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<()> {
+fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     let conntrack_out_path = pin_path.join("conntrack_out");
     let conntrack_in_path = pin_path.join("conntrack_in");
     if !conntrack_out_path.exists() || !conntrack_in_path.exists() {
-        return Ok(());
+        return Ok(GcResult {
+            total: 0,
+            expired: 0,
+            orphans: 0,
+        });
     }
 
     let map_data = MapData::from_pin(&conntrack_out_path)
@@ -658,35 +650,35 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<()> {
 
     let now = ktime_get_ns();
 
-    // Collect stale entries (can't remove while iterating)
-    let mut stale: Vec<(ConntrackKey, ConntrackValue)> = Vec::new();
+    // Phase 1: Expire CT entries whose absolute lifetime has passed.
+    // The BPF datapath writes `lifetime = now + timeout` on every matching packet;
+    // we simply check whether that deadline is in the past.
+    let mut expired: Vec<(ConntrackKey, ConntrackValue)> = Vec::new();
+    let mut total: u64 = 0;
     for item in conntrack_out.iter() {
         if let Ok((key, val)) = item {
-            let timeout = conntrack_timeout_ns(key.protocol, val.tcp_state);
-            if now.saturating_sub(val.last_seen_ns) > timeout {
-                stale.push((key, val));
+            total += 1;
+            if val.lifetime < now {
+                expired.push((key, val));
             }
         }
     }
 
-    if stale.is_empty() {
-        return Ok(());
+    if !expired.is_empty() {
+        info!("gc: removing {} expired entries (total: {})", expired.len(), total);
     }
-
-    info!("reaper: removing {} stale conntrack entries", stale.len());
-    for (key, val) in &stale {
+    for (key, val) in &expired {
         let client_ip = Ipv4Addr::from(u32::from_be(key.client_ip));
         let client_port = u16::from_be(key.client_port);
         let svc_port = u16::from_be(key.svc_port);
-        let idle_secs = now.saturating_sub(val.last_seen_ns) / 1_000_000_000;
+        let overdue_secs = now.saturating_sub(val.lifetime) / 1_000_000_000;
         info!(
-            "reaper: {} {}:{} -> :{} state={} idle={}s",
-            protocol_name(key.protocol),
+            "gc: tcp {}:{} -> :{} state={} overdue={}s",
             client_ip,
             client_port,
             svc_port,
-            conntrack_state_name(key.protocol, val.tcp_state),
-            idle_secs,
+            conntrack_state_name(val.tcp_state),
+            overdue_secs,
         );
 
         let _ = conntrack_out.remove(key);
@@ -702,7 +694,38 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<()> {
         let _ = conntrack_in.remove(&rev_key);
     }
 
-    Ok(())
+    // Phase 2: Purge orphan reverse entries — CONNTRACK_IN entries whose
+    // corresponding CONNTRACK_OUT entry no longer exists. This handles races
+    // where the forward entry was deleted but the reverse wasn't cleaned up.
+    let mut orphan_keys: Vec<ConntrackRevKey> = Vec::new();
+    for item in conntrack_in.iter() {
+        if let Ok((rev_key, rev_val)) = item {
+            let fwd_key = ConntrackKey {
+                client_ip: rev_val.client_ip,
+                client_port: rev_val.client_port,
+                svc_port: rev_val.orig_svc_port,
+                protocol: rev_key.protocol,
+                _pad: [0; 3],
+            };
+            if conntrack_out.get(&fwd_key, 0).is_err() {
+                orphan_keys.push(rev_key);
+            }
+        }
+    }
+
+    if !orphan_keys.is_empty() {
+        info!("gc: purging {} orphan reverse entries", orphan_keys.len());
+    }
+    for key in &orphan_keys {
+        let _ = conntrack_in.remove(key);
+    }
+
+    let result = GcResult {
+        total,
+        expired: expired.len() as u64,
+        orphans: orphan_keys.len() as u64,
+    };
+    Ok(result)
 }
 
 // ---- Other commands ----
@@ -793,8 +816,7 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
                 .map(aggregate_stats);
 
             println!(
-                "  {} :{} -> {}:{} (snat: {})",
-                protocol_name(key.protocol),
+                "  tcp :{} -> {}:{} (snat: {})",
                 key.port,
                 dst_ip,
                 dst_port,
