@@ -6,15 +6,95 @@ use aya::maps::{Array, HashMap};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
 use log::info;
+use serde::Deserialize;
 
 use crate::{
-    Config, IPPROTO_TCP, Lb4Backend, Lb4Key, Lb4ReverseNat, Lb4Service, MAP_PINS, SnatConfig,
+    IPPROTO_TCP, MAP_PINS,
     gc::{adapt_gc_interval, reap_conntrack},
     get_interface_ipv4,
     setup::setup_sysctl,
     state_dir_for,
     GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS,
 };
+
+// ---- Config ----
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    /// Network interface to attach XDP program to
+    pub interface: String,
+    /// IP address used as source in SNAT (auto-detected from interface if omitted)
+    pub snat_ip: Option<String>,
+    /// Max conntrack entries (default: 131072)
+    #[serde(default = "default_conntrack_size")]
+    pub conntrack_size: u32,
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
+}
+
+fn default_conntrack_size() -> u32 {
+    131_072
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RouteConfig {
+    pub port: u16,
+    pub to: String,
+}
+
+// ---- BPF map types for LB/SNAT config (must match vtether-xdp eBPF layout exactly) ----
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Lb4Key {
+    pub address: u32,
+    pub dport: u16,
+    pub backend_slot: u16,
+    pub proto: u8,
+    pub scope: u8,
+    pub _pad: [u8; 2],
+}
+unsafe impl aya::Pod for Lb4Key {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Lb4Service {
+    pub backend_id: u32,
+    pub count: u16,
+    pub rev_nat_index: u16,
+    pub flags: u8,
+    pub flags2: u8,
+    pub _pad: u16,
+}
+unsafe impl aya::Pod for Lb4Service {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Lb4Backend {
+    pub address: u32,
+    pub port: u16,
+    pub proto: u8,
+    pub flags: u8,
+}
+unsafe impl aya::Pod for Lb4Backend {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Lb4ReverseNat {
+    pub address: u32,
+    pub port: u16,
+    pub _pad: u16,
+}
+unsafe impl aya::Pod for Lb4ReverseNat {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnatConfig {
+    pub snat_addr: u32,
+    pub min_port: u16,
+    pub max_port: u16,
+}
+unsafe impl aya::Pod for SnatConfig {}
 
 #[allow(clippy::too_many_lines)]
 pub async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {

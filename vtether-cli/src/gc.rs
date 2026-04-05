@@ -3,10 +3,50 @@ use aya::maps::{HashMap, Map, MapData};
 use anyhow::Context as _;
 use log::info;
 
-use crate::{
-    CtEntry, Ipv4CtTuple, SnatEntry, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS, IPPROTO_TCP,
-    TUPLE_F_IN, TUPLE_F_SERVICE,
-};
+use crate::{GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS, IPPROTO_TCP, TUPLE_F_IN, TUPLE_F_SERVICE};
+
+// ---- BPF map types for conntrack (must match vtether-xdp eBPF layout exactly) ----
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Ipv4CtTuple {
+    pub daddr: u32,
+    pub saddr: u32,
+    pub dport: u16,
+    pub sport: u16,
+    pub nexthdr: u8,
+    pub flags: u8,
+}
+unsafe impl aya::Pod for Ipv4CtTuple {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CtEntry {
+    pub backend_id: u32,
+    pub rev_nat_index: u16,
+    pub closing: u8,
+    pub seen_non_syn: u8,
+    pub tx_flags_seen: u8,
+    pub rx_flags_seen: u8,
+    pub _pad: [u8; 2],
+    pub lifetime: u64,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+}
+unsafe impl aya::Pod for CtEntry {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnatEntry {
+    pub created: u64,
+    pub to_addr: u32,
+    pub to_port: u16,
+    pub svc_addr: u32,
+    pub svc_port: u16,
+}
+unsafe impl aya::Pod for SnatEntry {}
 
 pub struct GcResult {
     pub total: u64,

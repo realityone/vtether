@@ -4,9 +4,29 @@ use anyhow::Context as _;
 use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
 
 use crate::{
-    CtEntry, Ipv4CtTuple, Lb4Backend, Lb4Key, Lb4Service, RouteStats, RouteStatsKey, SnatEntry,
-    gc::ktime_get_ns,
+    gc::{CtEntry, Ipv4CtTuple, SnatEntry, ktime_get_ns},
+    proxy::{Lb4Backend, Lb4Key, Lb4Service},
 };
+
+// ---- BPF map types for route stats (must match vtether-xdp eBPF layout exactly) ----
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteStatsKey {
+    rev_nat_index: u16,
+    _pad: u16,
+}
+unsafe impl aya::Pod for RouteStatsKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteStats {
+    connections: u64,
+    packets: u64,
+    bytes: u64,
+    drops: u64,
+}
+unsafe impl aya::Pod for RouteStats {}
 
 #[allow(clippy::too_many_lines)]
 pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {
