@@ -57,8 +57,8 @@ macro_rules! debug_trace {
 }
 
 use conntrack::{
-    CT_EGRESS, CT_INGRESS, CT_SERVICE, CtState, CtStatus, Ipv4CtTuple, TUPLE_F_SERVICE,
-    ct_create4, ct_lazy_lookup4,
+    CT_EGRESS, CT_INGRESS, CT_SERVICE, CtState, CtStatus, Ipv4CtTuple, TUPLE_F_SERVICE, ct_create4,
+    ct_lazy_lookup4,
 };
 use lb::{Lb4Key, lb4_fill_key, lb4_lookup_backend, lb4_lookup_service, lb4_select_backend_id};
 use nat::SnatTarget;
@@ -253,11 +253,10 @@ fn handle_reply(
     let pass = aya_ebpf::bindings::xdp_action::XDP_PASS;
 
     // revSNAT now also returns VIP + svc_port for CT key reconstruction
-    let (client_ip, client_port, svc_addr, svc_port) =
-        match nat::snat_v4_rev_nat(ctx, ip, l4_off) {
-            Ok(result) => result,
-            Err(()) => return Ok(pass), // No SNAT mapping — not our traffic, expected
-        };
+    let (client_ip, client_port, svc_addr, svc_port) = match nat::snat_v4_rev_nat(ctx, ip, l4_off) {
+        Ok(result) => result,
+        Err(()) => return Ok(pass), // No SNAT mapping — not our traffic, expected
+    };
     debug_debug!(ctx, "REPLY: revSNAT ok");
 
     // Reconstruct the same service CT tuple used by forward path

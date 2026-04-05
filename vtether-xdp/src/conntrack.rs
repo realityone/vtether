@@ -291,11 +291,7 @@ pub fn ct_lazy_lookup4(
 /// `update_dir` controls initial flag setup: CT_EGRESS sets tx_flags=SYN,
 /// CT_INGRESS sets rx_flags=SYN.
 #[inline(always)]
-pub fn ct_create4(
-    tuple: &Ipv4CtTuple,
-    ct_state: &CtState,
-    update_dir: u8,
-) -> Result<(), ()> {
+pub fn ct_create4(tuple: &Ipv4CtTuple, ct_state: &CtState, update_dir: u8) -> Result<(), ()> {
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
     let entry = CtEntry {

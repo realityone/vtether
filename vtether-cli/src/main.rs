@@ -1112,7 +1112,11 @@ fn print_ct_entry(tuple: &Ipv4CtTuple, entry: &CtEntry, now_ns: u64) {
     let dport = u16::from_be(tuple.dport);
 
     let remaining_s = (entry.lifetime as f64 - now_ns as f64) / 1e9;
-    let status = if remaining_s > 0.0 { "ALIVE" } else { "EXPIRED" };
+    let status = if remaining_s > 0.0 {
+        "ALIVE"
+    } else {
+        "EXPIRED"
+    };
 
     println!(
         "  {}:{} -> {}:{}  dir={}  [{}]",
