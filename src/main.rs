@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
+use aya::maps::{Array, HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
 use clap::{Parser, Subcommand};
@@ -15,11 +15,6 @@ const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
 const STATE_BASE_DIR: &str = "/run/vtether";
 
 const IPPROTO_TCP: u8 = 6;
-
-// tcp_state bitfield (must match eBPF)
-const TCP_STATE_ESTABLISHED: u8 = 0x01;
-const TCP_STATE_FIN_CLIENT: u8 = 0x02;
-const TCP_STATE_FIN_SERVER: u8 = 0x04;
 
 // Adaptive GC interval bounds
 const GC_INTERVAL_MIN_SECS: u64 = 10;
@@ -84,7 +79,7 @@ struct Config {
     interface: String,
     /// IP address used as source in SNAT (auto-detected from interface if omitted)
     snat_ip: Option<String>,
-    /// Max conntrack entries (default: 65536)
+    /// Max conntrack entries (default: 131072)
     #[serde(default = "default_conntrack_size")]
     conntrack_size: u32,
     #[serde(default)]
@@ -92,7 +87,7 @@ struct Config {
 }
 
 fn default_conntrack_size() -> u32 {
-    65536
+    131072
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,78 +96,107 @@ struct RouteConfig {
     to: String,
 }
 
-// ---- BPF map types (must match vtether-ebpf exactly) ----
+// ---- BPF map types (must match vtether-xdp2 eBPF layout exactly) ----
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct NatKey {
-    port: u16,
-    protocol: u8,
-    _pad: u8,
+struct Lb4Key {
+    address: u32,
+    dport: u16,
+    backend_slot: u16,
+    proto: u8,
+    scope: u8,
+    _pad: [u8; 2],
 }
-
-unsafe impl aya::Pod for NatKey {}
+unsafe impl aya::Pod for Lb4Key {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct NatConfigEntry {
-    dst_ip: u32,
-    snat_ip: u32,
-    dst_port: u16,
+struct Lb4Service {
+    backend_id: u32,
+    count: u16,
+    rev_nat_index: u16,
+    flags: u8,
+    flags2: u8,
     _pad: u16,
 }
-
-unsafe impl aya::Pod for NatConfigEntry {}
+unsafe impl aya::Pod for Lb4Service {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ConntrackKey {
-    client_ip: u32,
-    client_port: u16,
-    svc_port: u16,
-    protocol: u8,
-    _pad: [u8; 3],
+struct Lb4Backend {
+    address: u32,
+    port: u16,
+    proto: u8,
+    flags: u8,
 }
-
-unsafe impl aya::Pod for ConntrackKey {}
+unsafe impl aya::Pod for Lb4Backend {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ConntrackValue {
-    snat_ip: u32,
-    dst_ip: u32,
+struct Lb4ReverseNat {
+    address: u32,
+    port: u16,
+    _pad: u16,
+}
+unsafe impl aya::Pod for Lb4ReverseNat {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SnatConfig {
+    snat_addr: u32,
+    min_port: u16,
+    max_port: u16,
+}
+unsafe impl aya::Pod for SnatConfig {}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Ipv4CtTuple {
+    daddr: u32,
+    saddr: u32,
+    dport: u16,
+    sport: u16,
+    nexthdr: u8,
+    flags: u8,
+}
+unsafe impl aya::Pod for Ipv4CtTuple {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CtEntry {
+    backend_id: u32,
+    rev_nat_index: u16,
+    closing: u8,
+    seen_non_syn: u8,
+    tx_flags_seen: u8,
+    rx_flags_seen: u8,
+    _pad: [u8; 2],
     lifetime: u64,
-    orig_dst_port: u16,
-    new_dst_port: u16,
-    snat_port: u16,
-    tcp_state: u8,
-    _pad: u8,
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
 }
-
-unsafe impl aya::Pod for ConntrackValue {}
+unsafe impl aya::Pod for CtEntry {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ConntrackRevKey {
-    dst_ip: u32,
-    svc_port: u16,
-    snat_port: u16,
-    protocol: u8,
-    _pad: [u8; 3],
+struct SnatEntry {
+    created: u64,
+    to_addr: u32,
+    to_port: u16,
+    _pad: u16,
 }
-
-unsafe impl aya::Pod for ConntrackRevKey {}
+unsafe impl aya::Pod for SnatEntry {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ConntrackRevValue {
-    client_ip: u32,
-    snat_ip: u32,
-    orig_svc_port: u16,
-    client_port: u16,
+struct RouteStatsKey {
+    rev_nat_index: u16,
+    _pad: u16,
 }
-
-unsafe impl aya::Pod for ConntrackRevValue {}
+unsafe impl aya::Pod for RouteStatsKey {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -182,8 +206,19 @@ struct RouteStats {
     bytes: u64,
     drops: u64,
 }
-
 unsafe impl aya::Pod for RouteStats {}
+
+// ---- Map pin names ----
+
+const MAP_PINS: &[(&str, &str)] = &[
+    ("LB4_SERVICES", "lb4_services"),
+    ("LB4_BACKENDS", "lb4_backends"),
+    ("LB4_REVERSE_NAT", "lb4_reverse_nat"),
+    ("SNAT_CONFIG", "snat_config"),
+    ("CT4", "ct4"),
+    ("SNAT4", "snat4"),
+    ("ROUTE_STATS", "route_stats"),
+];
 
 // ---- Main ----
 
@@ -208,9 +243,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Compute a per-instance state directory under /run/vtether/ derived from the pin path.
-/// bpffs only supports BPF object pins, so regular files (like interface name) go here.
 fn state_dir_for(pin_path: &std::path::Path) -> PathBuf {
-    // Use the pin path's last component as the instance name
     let instance = pin_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -265,7 +298,6 @@ fn setup() -> anyhow::Result<()> {
 
     let default_iface = get_default_interface().unwrap_or_else(|_| "eth0".to_string());
 
-    // Write default config
     let config_dir = PathBuf::from(DEFAULT_CONFIG_PATH)
         .parent()
         .unwrap()
@@ -285,8 +317,8 @@ interface: {default_iface}
 # Source IP for SNAT (optional, auto-detected from interface)
 # snat_ip: \"192.168.1.100\"
 
-# Max conntrack entries (default: 65536)
-# conntrack_size: 65536
+# Max conntrack entries (default: 131072)
+# conntrack_size: 131072
 
 # TCP forwarding routes
 # routes:
@@ -303,7 +335,6 @@ interface: {default_iface}
         println!("  exists  {} (not overwritten)", DEFAULT_CONFIG_PATH);
     }
 
-    // Write systemd unit file
     let unit_content = format!(
         "\
 [Unit]
@@ -325,7 +356,6 @@ WantedBy=multi-user.target
         .with_context(|| format!("failed to write {}", SYSTEMD_UNIT_PATH))?;
     println!("  created {}", SYSTEMD_UNIT_PATH);
 
-    // Reload systemd
     let status = std::process::Command::new("systemctl")
         .args(["daemon-reload"])
         .status()
@@ -370,7 +400,6 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     let config: Config =
         serde_yaml::from_str(&config_str).context("failed to parse config YAML")?;
 
-    // Check if already running before anything else
     let prog_pin = pin_path.join("prog");
     anyhow::ensure!(
         !prog_pin.exists(),
@@ -410,57 +439,103 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     // Check for duplicate ports
     let mut seen = std::collections::HashSet::new();
     for (port, _) in &parsed_routes {
-        anyhow::ensure!(
-            seen.insert(*port),
-            "duplicate route: tcp/{}",
-            port
-        );
+        anyhow::ensure!(seen.insert(*port), "duplicate route: tcp/{}", port);
     }
 
-    // Load eBPF with configurable conntrack map size
+    // Load vtether-xdp2 eBPF with configurable conntrack map size
     let mut ebpf = aya::EbpfLoader::new()
-        .set_max_entries("CONNTRACK_OUT", config.conntrack_size)
-        .set_max_entries("CONNTRACK_IN", config.conntrack_size)
+        .set_max_entries("CT4", config.conntrack_size)
+        .set_max_entries("SNAT4", config.conntrack_size)
         .load(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
-            "/vtether-forward"
+            "/vtether-xdp2-forward"
         )))
         .context("failed to load eBPF bytecode")?;
 
-    // Populate NAT_CONFIG map
-    {
-        let mut nat_config: HashMap<_, NatKey, NatConfigEntry> =
-            HashMap::try_from(ebpf.map_mut("NAT_CONFIG").context("NAT_CONFIG map not found")?)?;
+    // Populate LB maps (one at a time to satisfy borrow checker)
+    for (i, (port, to)) in parsed_routes.iter().enumerate() {
+        let backend_id = (i + 1) as u32;
+        let rev_nat_index = backend_id as u16;
+        let listen_port_be = port.to_be();
+        let backend_ip_be = u32::from(*to.ip()).to_be();
+        let backend_port_be = to.port().to_be();
 
-        for (port, to) in &parsed_routes {
-            let key = NatKey {
-                port: *port,
-                protocol: IPPROTO_TCP,
-                _pad: 0,
-            };
-            let entry = NatConfigEntry {
-                dst_ip: u32::from(*to.ip()).to_be(),
-                snat_ip: snat_ip_be,
-                dst_port: to.port().to_be(),
-                _pad: 0,
-            };
-            nat_config.insert(key, entry, 0)?;
+        // LB4_SERVICES: slot 0 (service descriptor) + slot 1 (backend ref)
+        {
+            let mut svc_map: HashMap<_, Lb4Key, Lb4Service> = HashMap::try_from(
+                ebpf.map_mut("LB4_SERVICES").context("LB4_SERVICES not found")?,
+            )?;
+            svc_map.insert(
+                Lb4Key { address: snat_ip_be, dport: listen_port_be, backend_slot: 0,
+                         proto: IPPROTO_TCP, scope: 0, _pad: [0; 2] },
+                Lb4Service { backend_id: 0, count: 1, rev_nat_index,
+                             flags: 0, flags2: 0, _pad: 0 },
+                0,
+            )?;
+            svc_map.insert(
+                Lb4Key { address: snat_ip_be, dport: listen_port_be, backend_slot: 1,
+                         proto: IPPROTO_TCP, scope: 0, _pad: [0; 2] },
+                Lb4Service { backend_id, count: 0, rev_nat_index,
+                             flags: 0, flags2: 0, _pad: 0 },
+                0,
+            )?;
+        }
+
+        // LB4_BACKENDS
+        {
+            let mut be_map: HashMap<_, u32, Lb4Backend> = HashMap::try_from(
+                ebpf.map_mut("LB4_BACKENDS").context("LB4_BACKENDS not found")?,
+            )?;
+            be_map.insert(
+                backend_id,
+                Lb4Backend { address: backend_ip_be, port: backend_port_be,
+                             proto: IPPROTO_TCP, flags: 0 },
+                0,
+            )?;
+        }
+
+        // LB4_REVERSE_NAT
+        {
+            let mut rev_map: HashMap<_, u16, Lb4ReverseNat> = HashMap::try_from(
+                ebpf.map_mut("LB4_REVERSE_NAT").context("LB4_REVERSE_NAT not found")?,
+            )?;
+            rev_map.insert(
+                rev_nat_index,
+                Lb4ReverseNat { address: snat_ip_be, port: listen_port_be, _pad: 0 },
+                0,
+            )?;
         }
     }
 
-    // Create pin directory and pin maps before taking mutable program reference
+    // Populate SNAT_CONFIG
+    {
+        let mut snat_map: Array<_, SnatConfig> =
+            Array::try_from(ebpf.map_mut("SNAT_CONFIG").context("SNAT_CONFIG not found")?)?;
+        snat_map.set(
+            0,
+            SnatConfig {
+                snat_addr: snat_ip_be,
+                min_port: 32768,
+                max_port: 60999,
+            },
+            0,
+        )?;
+    }
+
+    // Init eBPF logger
+    #[allow(clippy::ignored_unit_patterns)]
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        log::warn!("failed to init eBPF logger: {}", e);
+    }
+
+    // Pin maps
     std::fs::create_dir_all(&pin_path)
         .with_context(|| format!("failed to create pin dir: {}", pin_path.display()))?;
 
-    for (name, pin_name) in [
-        ("NAT_CONFIG", "nat_config"),
-        ("CONNTRACK_OUT", "conntrack_out"),
-        ("CONNTRACK_IN", "conntrack_in"),
-        ("ROUTE_STATS", "route_stats"),
-    ] {
-        if let Some(map) = ebpf.map(name) {
+    for &(map_name, pin_name) in MAP_PINS {
+        if let Some(map) = ebpf.map(map_name) {
             map.pin(pin_path.join(pin_name))
-                .with_context(|| format!("failed to pin {} map", name))?;
+                .with_context(|| format!("failed to pin {} map", map_name))?;
         }
     }
 
@@ -471,13 +546,10 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         .try_into()?;
     prog.load()
         .context("failed to load XDP program into kernel")?;
-
-    // Attach first, then pin — so partial failures don't leave stale pins.
     let link_id = prog
         .attach(&config.interface, XdpFlags::default())
         .with_context(|| format!("failed to attach XDP to {}", config.interface))?;
 
-    // From here on, use a closure to clean up on failure.
     let state_dir = state_dir_for(&pin_path);
     let finish = || -> anyhow::Result<()> {
         prog.pin(&prog_pin)
@@ -491,25 +563,22 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
             .pin(pin_path.join("link"))
             .context("failed to pin XDP link to bpffs")?;
 
-        // Save state for `proxy destroy` in a regular filesystem directory
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("failed to create state dir: {}", state_dir.display()))?;
         std::fs::write(state_dir.join("interface"), &config.interface)?;
 
-        // Configure kernel for XDP NAT forwarding
         setup_sysctl(&config.interface)?;
 
         Ok(())
     };
 
     if let Err(e) = finish() {
-        // Clean up: detach XDP and remove any partial pins/state
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "dev", &config.interface, "xdp", "off"])
             .status();
         let _ = std::fs::remove_file(&prog_pin);
         let _ = std::fs::remove_file(pin_path.join("link"));
-        for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
+        for &(_, pin_name) in MAP_PINS {
             let _ = std::fs::remove_file(pin_path.join(pin_name));
         }
         let _ = std::fs::remove_dir(&pin_path);
@@ -530,7 +599,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         info!("route: tcp :{} -> {}", port, to);
     }
 
-    // Spawn conntrack GC task with adaptive interval
+    // Spawn conntrack GC task
     let reaper_pin_path = pin_path.clone();
     let reaper_handle = tokio::spawn(async move {
         let mut gc_interval_secs = GC_INTERVAL_DEFAULT_SECS;
@@ -581,7 +650,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     Ok(())
 }
 
-// ---- Conntrack reaper ----
+// ---- Conntrack GC ----
 
 fn ktime_get_ns() -> u64 {
     let ts = nix::time::ClockId::CLOCK_BOOTTIME
@@ -590,142 +659,93 @@ fn ktime_get_ns() -> u64 {
     ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
 }
 
-fn conntrack_state_name(tcp_state: u8) -> &'static str {
-    let est = tcp_state & TCP_STATE_ESTABLISHED != 0;
-    let fin = tcp_state & (TCP_STATE_FIN_CLIENT | TCP_STATE_FIN_SERVER) != 0;
-    match (est, fin) {
-        (false, _) => "SYN_SENT",
-        (true, false) => "ESTABLISHED",
-        (true, true) => "CLOSING",
-    }
-}
-
 struct GcResult {
     total: u64,
     expired: u64,
     orphans: u64,
 }
 
-/// Adapt the GC interval based on the deletion ratio from the last cycle.
-/// Inspired by Cilium's adaptive CT GC interval:
-///   >25% expired → halve interval (more pressure, scan faster)
-///   <5% expired  → 1.5x interval (less pressure, scan slower)
 fn adapt_gc_interval(current_secs: u64, total: u64, expired: u64) -> u64 {
     if total == 0 {
         return current_secs;
     }
     let ratio = expired * 100 / total;
-    let new_secs = if ratio > 25 {
-        current_secs / 2
-    } else if ratio < 5 {
-        current_secs * 3 / 2
-    } else {
-        current_secs
+    let new_secs = match ratio {
+        26.. => current_secs / 2,
+        0..5 => current_secs * 3 / 2,
+        _ => current_secs,
     };
     new_secs.clamp(GC_INTERVAL_MIN_SECS, GC_INTERVAL_MAX_SECS)
 }
 
 fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
-    let conntrack_out_path = pin_path.join("conntrack_out");
-    let conntrack_in_path = pin_path.join("conntrack_in");
-    if !conntrack_out_path.exists() || !conntrack_in_path.exists() {
-        return Ok(GcResult {
-            total: 0,
-            expired: 0,
-            orphans: 0,
-        });
+    let ct4_path = pin_path.join("ct4");
+    let snat4_path = pin_path.join("snat4");
+    if !ct4_path.exists() {
+        return Ok(GcResult { total: 0, expired: 0, orphans: 0 });
     }
 
-    let map_data = MapData::from_pin(&conntrack_out_path)
-        .context("failed to load pinned CONNTRACK_OUT")?;
+    let map_data = MapData::from_pin(&ct4_path).context("failed to load pinned CT4")?;
     let map = Map::HashMap(map_data);
-    let mut conntrack_out: HashMap<_, ConntrackKey, ConntrackValue> =
-        HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
-
-    let map_data = MapData::from_pin(&conntrack_in_path)
-        .context("failed to load pinned CONNTRACK_IN")?;
-    let map = Map::HashMap(map_data);
-    let mut conntrack_in: HashMap<_, ConntrackRevKey, ConntrackRevValue> =
-        HashMap::try_from(map).context("failed to parse CONNTRACK_IN map")?;
+    let mut ct4: HashMap<_, Ipv4CtTuple, CtEntry> =
+        HashMap::try_from(map).context("failed to parse CT4 map")?;
 
     let now = ktime_get_ns();
 
-    // Phase 1: Expire CT entries whose absolute lifetime has passed.
-    // The BPF datapath writes `lifetime = now + timeout` on every matching packet;
-    // we simply check whether that deadline is in the past.
-    let mut expired: Vec<(ConntrackKey, ConntrackValue)> = Vec::new();
+    // Phase 1: Expire CT entries whose lifetime has passed.
+    let mut expired_keys: Vec<Ipv4CtTuple> = Vec::new();
     let mut total: u64 = 0;
-    for item in conntrack_out.iter() {
+    for item in ct4.iter() {
         if let Ok((key, val)) = item {
             total += 1;
             if val.lifetime < now {
-                expired.push((key, val));
+                expired_keys.push(key);
             }
         }
     }
 
-    if !expired.is_empty() {
-        info!("gc: removing {} expired entries (total: {})", expired.len(), total);
+    if !expired_keys.is_empty() {
+        info!("gc: removing {} expired CT entries (total: {})", expired_keys.len(), total);
     }
-    for (key, val) in &expired {
-        let client_ip = Ipv4Addr::from(u32::from_be(key.client_ip));
-        let client_port = u16::from_be(key.client_port);
-        let svc_port = u16::from_be(key.svc_port);
-        let overdue_secs = now.saturating_sub(val.lifetime) / 1_000_000_000;
-        info!(
-            "gc: tcp {}:{} -> :{} state={} overdue={}s",
-            client_ip,
-            client_port,
-            svc_port,
-            conntrack_state_name(val.tcp_state),
-            overdue_secs,
-        );
-
-        let _ = conntrack_out.remove(key);
-
-        // Remove corresponding reverse entry
-        let rev_key = ConntrackRevKey {
-            dst_ip: val.dst_ip,
-            svc_port: val.new_dst_port,
-            snat_port: val.snat_port,
-            protocol: key.protocol,
-            _pad: [0; 3],
-        };
-        let _ = conntrack_in.remove(&rev_key);
+    for key in &expired_keys {
+        let _ = ct4.remove(key);
     }
 
-    // Phase 2: Purge orphan reverse entries — CONNTRACK_IN entries whose
-    // corresponding CONNTRACK_OUT entry no longer exists. This handles races
-    // where the forward entry was deleted but the reverse wasn't cleaned up.
-    let mut orphan_keys: Vec<ConntrackRevKey> = Vec::new();
-    for item in conntrack_in.iter() {
-        if let Ok((rev_key, rev_val)) = item {
-            let fwd_key = ConntrackKey {
-                client_ip: rev_val.client_ip,
-                client_port: rev_val.client_port,
-                svc_port: rev_val.orig_svc_port,
-                protocol: rev_key.protocol,
-                _pad: [0; 3],
-            };
-            if conntrack_out.get(&fwd_key, 0).is_err() {
-                orphan_keys.push(rev_key);
+    // Phase 2: Expire SNAT entries (created timestamp + 6h timeout)
+    let mut snat_orphans: u64 = 0;
+    if snat4_path.exists() {
+        let snat_map_data =
+            MapData::from_pin(&snat4_path).context("failed to load pinned SNAT4")?;
+        let snat_map = Map::HashMap(snat_map_data);
+        let mut snat4: HashMap<_, Ipv4CtTuple, SnatEntry> =
+            HashMap::try_from(snat_map).context("failed to parse SNAT4 map")?;
+
+        // SNAT entries don't have a lifetime field; they're valid as long as
+        // the corresponding CT entry exists. Remove SNAT entries that are older
+        // than 6 hours (CT_ESTABLISHED_TIMEOUT).
+        const SNAT_MAX_AGE_NS: u64 = 21_600 * 1_000_000_000; // 6 hours
+        let mut snat_expired: Vec<Ipv4CtTuple> = Vec::new();
+        for item in snat4.iter() {
+            if let Ok((key, val)) = item {
+                if now.saturating_sub(val.created) > SNAT_MAX_AGE_NS {
+                    snat_expired.push(key);
+                }
             }
         }
+        if !snat_expired.is_empty() {
+            info!("gc: removing {} expired SNAT entries", snat_expired.len());
+        }
+        for key in &snat_expired {
+            let _ = snat4.remove(key);
+        }
+        snat_orphans = snat_expired.len() as u64;
     }
 
-    if !orphan_keys.is_empty() {
-        info!("gc: purging {} orphan reverse entries", orphan_keys.len());
-    }
-    for key in &orphan_keys {
-        let _ = conntrack_in.remove(key);
-    }
-
-    let result = GcResult {
+    Ok(GcResult {
         total,
-        expired: expired.len() as u64,
-        orphans: orphan_keys.len() as u64,
-    };
-    Ok(result)
+        expired: expired_keys.len() as u64,
+        orphans: snat_orphans,
+    })
 }
 
 // ---- Other commands ----
@@ -738,12 +758,10 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
         prog_pin.display()
     );
 
-    // Read saved interface name from state directory
     let state_dir = state_dir_for(&pin_path);
     let interface = std::fs::read_to_string(state_dir.join("interface"))
         .context("failed to read interface; was proxy started with `proxy up`?")?;
 
-    // Unpin link (this detaches XDP from the interface)
     let link_pin = pin_path.join("link");
     if link_pin.exists() {
         let link = aya::programs::links::PinnedLink::from_pin(&link_pin)
@@ -751,14 +769,13 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
         link.unpin().context("failed to unpin link")?;
     }
 
-    // Fallback: also try `ip link set xdp off` in case pin was stale
     let _ = std::process::Command::new("ip")
         .args(["link", "set", "dev", interface.trim(), "xdp", "off"])
         .status();
 
-    // Unpin program, maps, and clean up
     let _ = std::fs::remove_file(&prog_pin);
-    for pin_name in ["nat_config", "conntrack_out", "conntrack_in", "route_stats"] {
+    let _ = std::fs::remove_file(pin_path.join("link"));
+    for &(_, pin_name) in MAP_PINS {
         let _ = std::fs::remove_file(pin_path.join(pin_name));
     }
     let _ = std::fs::remove_dir(&pin_path);
@@ -783,46 +800,73 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
     println!("vtether: attached to {}", interface.trim());
 
     // Load route stats map (per-CPU)
-    let stats_map = pin_path.join("route_stats");
-    let route_stats: Option<PerCpuHashMap<_, NatKey, RouteStats>> = if stats_map.exists() {
+    let stats_path = pin_path.join("route_stats");
+    let route_stats: Option<PerCpuHashMap<_, RouteStatsKey, RouteStats>> = if stats_path.exists() {
         let map_data =
-            MapData::from_pin(&stats_map).context("failed to load pinned ROUTE_STATS")?;
+            MapData::from_pin(&stats_path).context("failed to load pinned ROUTE_STATS")?;
         let map = Map::PerCpuHashMap(map_data);
         Some(PerCpuHashMap::try_from(map).context("failed to parse ROUTE_STATS map")?)
     } else {
         None
     };
 
-    // Read NAT_CONFIG map — show configured routes with stats
-    let nat_config_path = pin_path.join("nat_config");
-    if nat_config_path.exists() {
-        let map_data =
-            MapData::from_pin(&nat_config_path).context("failed to load pinned NAT_CONFIG")?;
-        let map = Map::HashMap(map_data);
-        let nat_config: HashMap<_, NatKey, NatConfigEntry> =
-            HashMap::try_from(map).context("failed to parse NAT_CONFIG map")?;
+    // Read LB4_SERVICES + LB4_BACKENDS + LB4_REVERSE_NAT to show routes
+    let svc_path = pin_path.join("lb4_services");
+    let be_path = pin_path.join("lb4_backends");
+    let _rev_path = pin_path.join("lb4_reverse_nat");
+
+    if svc_path.exists() && be_path.exists() {
+        let svc_map: HashMap<_, Lb4Key, Lb4Service> = HashMap::try_from(
+            Map::HashMap(MapData::from_pin(&svc_path).context("failed to load LB4_SERVICES")?),
+        )?;
+        let be_map: HashMap<_, u32, Lb4Backend> = HashMap::try_from(Map::HashMap(
+            MapData::from_pin(&be_path).context("failed to load LB4_BACKENDS")?,
+        ))?;
 
         println!("\nRoutes:");
-        for item in nat_config.iter() {
-            let (key, entry) = item.map_err(|e| anyhow::anyhow!("map iteration error: {}", e))?;
-            let dst_ip = Ipv4Addr::from(u32::from_be(entry.dst_ip));
-            let snat_ip = Ipv4Addr::from(u32::from_be(entry.snat_ip));
-            let dst_port = u16::from_be(entry.dst_port);
+        // Iterate service entries (slot 0 only)
+        for item in svc_map.iter() {
+            let (key, svc) = item.map_err(|e| anyhow::anyhow!("map iteration error: {}", e))?;
+            if key.backend_slot != 0 {
+                continue;
+            }
 
-            // Look up stats for this route, aggregating across all CPUs
-            let stats = route_stats
+            // Find the backend for slot 1
+            let listen_port = u16::from_be(key.dport);
+            let snat_ip = Ipv4Addr::from(u32::from_be(key.address));
+
+            // Look up backend via slot 1
+            if let Ok(slot1_svc) = svc_map.get(
+                &Lb4Key {
+                    address: key.address,
+                    dport: key.dport,
+                    backend_slot: 1,
+                    proto: key.proto,
+                    scope: key.scope,
+                    _pad: [0; 2],
+                },
+                0,
+            ) {
+                if let Ok(backend) = be_map.get(&slot1_svc.backend_id, 0) {
+                    let dst_ip = Ipv4Addr::from(u32::from_be(backend.address));
+                    let dst_port = u16::from_be(backend.port);
+                    println!(
+                        "  tcp :{} -> {}:{} (snat: {})",
+                        listen_port, dst_ip, dst_port, snat_ip,
+                    );
+                }
+            }
+
+            // Stats
+            let stats_key = RouteStatsKey {
+                rev_nat_index: svc.rev_nat_index,
+                _pad: 0,
+            };
+            if let Some(s) = route_stats
                 .as_ref()
-                .and_then(|m| m.get(&key, 0).ok())
-                .map(aggregate_stats);
-
-            println!(
-                "  tcp :{} -> {}:{} (snat: {})",
-                key.port,
-                dst_ip,
-                dst_port,
-                snat_ip,
-            );
-            if let Some(s) = stats {
+                .and_then(|m| m.get(&stats_key, 0).ok())
+                .map(aggregate_stats)
+            {
                 print!(
                     "    connections: {}  packets: {}  bytes: {}",
                     s.connections,
@@ -837,18 +881,17 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    // Read CONNTRACK_OUT map — count active connections
-    let conntrack_out_path = pin_path.join("conntrack_out");
-    if conntrack_out_path.exists() {
+    // Count active CT entries
+    let ct4_path = pin_path.join("ct4");
+    if ct4_path.exists() {
         match (|| -> anyhow::Result<usize> {
-            let map_data = MapData::from_pin(&conntrack_out_path)
-                .context("failed to load pinned CONNTRACK_OUT")?;
+            let map_data = MapData::from_pin(&ct4_path).context("failed to load pinned CT4")?;
             let map = Map::HashMap(map_data);
-            let conntrack: HashMap<_, ConntrackKey, ConntrackValue> =
-                HashMap::try_from(map).context("failed to parse CONNTRACK_OUT map")?;
-            Ok(conntrack.iter().filter(|i| i.is_ok()).count())
+            let ct4: HashMap<_, Ipv4CtTuple, CtEntry> =
+                HashMap::try_from(map).context("failed to parse CT4 map")?;
+            Ok(ct4.iter().filter(|i| i.is_ok()).count())
         })() {
-            Ok(count) => println!("\nActive connections: {}", count),
+            Ok(count) => println!("\nActive connections: {} (CT entries / 2)", count),
             Err(e) => println!("\nActive connections: unknown ({:#})", e),
         }
     }
