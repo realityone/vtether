@@ -1,0 +1,15 @@
+[package]
+name = "vtether-xdp2"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "vtether-xdp2-forward"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"

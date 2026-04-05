@@ -13,6 +13,11 @@ fn main() {
                 root_dir: "vtether-xdp",
                 ..Default::default()
             },
+            aya_build::Package {
+                name: "vtether-xdp2",
+                root_dir: "vtether-xdp2",
+                ..Default::default()
+            },
         ],
         aya_build::Toolchain::Nightly,
     )
