@@ -73,3 +73,7 @@ vtether version
 
 - Linux with XDP-capable NIC driver and bpffs mounted at `/sys/fs/bpf`
 - Root privileges
+
+## Acknowledgements
+
+Much of the design and implementation is inspired by [Cilium](https://github.com/cilium/cilium). Great thanks to the Cilium team.
