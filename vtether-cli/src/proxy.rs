@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::{
     gc::{
-        IPPROTO_TCP, GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS,
+        GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS, IPPROTO_TCP,
         adapt_gc_interval, reap_conntrack,
     },
     helper::{get_interface_ipv4, state_dir_for},

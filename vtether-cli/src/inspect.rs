@@ -90,14 +90,11 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
                     _pad: [0; 2],
                 },
                 0,
-            )
-                && let Ok(backend) = be_map.get(&slot1_svc.backend_id, 0)
+            ) && let Ok(backend) = be_map.get(&slot1_svc.backend_id, 0)
             {
                 let dst_ip = Ipv4Addr::from(u32::from_be(backend.address));
                 let dst_port = u16::from_be(backend.port);
-                println!(
-                    "  tcp :{listen_port} -> {dst_ip}:{dst_port} (snat: {snat_ip})",
-                );
+                println!("  tcp :{listen_port} -> {dst_ip}:{dst_port} (snat: {snat_ip})",);
             }
 
             // Stats

@@ -7,9 +7,10 @@ const STATE_BASE_DIR: &str = "/run/vtether";
 
 /// Compute a per-instance state directory under /run/vtether/ derived from the pin path.
 pub fn state_dir_for(pin_path: &std::path::Path) -> PathBuf {
-    let instance = pin_path
-        .file_name()
-        .map_or_else(|| "default".to_string(), |n| n.to_string_lossy().into_owned());
+    let instance = pin_path.file_name().map_or_else(
+        || "default".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     PathBuf::from(STATE_BASE_DIR).join(instance)
 }
 
