@@ -79,9 +79,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup => setup::setup(),
         Commands::Remove => setup::remove(),
         Commands::Version => {
-            helper::print_version();
+            print_version();
             Ok(())
         }
         Commands::Inspect { pin_path, verbose } => inspect::inspect(&pin_path, verbose),
     }
+}
+
+fn print_version() {
+    println!(
+        "vtether {} (commit {}, built {})",
+        env!("VT_VERSION"),
+        env!("VT_COMMIT"),
+        env!("VT_BUILD_DATE"),
+    );
 }

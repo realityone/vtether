@@ -13,15 +13,6 @@ pub fn state_dir_for(pin_path: &std::path::Path) -> PathBuf {
     PathBuf::from(STATE_BASE_DIR).join(instance)
 }
 
-pub fn print_version() {
-    println!(
-        "vtether {} (commit {}, built {})",
-        env!("VT_VERSION"),
-        env!("VT_COMMIT"),
-        env!("VT_BUILD_DATE"),
-    );
-}
-
 pub fn get_interface_ipv4(interface: &str) -> anyhow::Result<Ipv4Addr> {
     let addrs = nix::ifaddrs::getifaddrs().context("failed to enumerate interface addresses")?;
     for ifaddr in addrs {
