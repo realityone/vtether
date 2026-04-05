@@ -41,6 +41,7 @@ pub enum CtStatus {
     /// Existing forward entry found.
     Established,
     /// Existing reverse (reply) entry found.
+    #[allow(dead_code)]
     Reply,
 }
 
@@ -446,6 +447,7 @@ pub fn ct_create4(tuple: &Ipv4CtTuple, ct_state: &CtState) -> Result<(), ()> {
 /// Cilium equivalent: `ct_update_svc_entry()`.
 /// Used when a backend changes (e.g., backend deleted, need to re-select).
 #[inline(always)]
+#[allow(dead_code)]
 pub fn ct_update_svc_entry(tuple: &Ipv4CtTuple, backend_id: u32, rev_nat_index: u16) {
     if let Some(entry) = CT4.get_ptr_mut(tuple) {
         unsafe {
@@ -460,6 +462,7 @@ pub fn ct_update_svc_entry(tuple: &Ipv4CtTuple, backend_id: u32, rev_nat_index: 
 /// Cilium equivalent: `ipv4_ct_tuple_reverse()`.
 /// Used to create the reverse CT entry from the forward tuple.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn ipv4_ct_tuple_reverse(tuple: &Ipv4CtTuple) -> Ipv4CtTuple {
     Ipv4CtTuple {
         daddr: tuple.saddr,

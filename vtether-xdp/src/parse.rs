@@ -11,7 +11,9 @@ pub const ETH_HDR_LEN: usize = 14;
 pub const IPPROTO_TCP: u8 = 6;
 
 // IPv4 header field offsets (bytes from start of IPv4 header)
+#[allow(dead_code)]
 pub const IPV4_SADDR_OFF: usize = 12;
+#[allow(dead_code)]
 pub const IPV4_DADDR_OFF: usize = 16;
 
 // TCP header field offsets (bytes from start of TCP header)
@@ -172,8 +174,60 @@ pub fn load_tcp_flags(ctx: &XdpContext, l4_off: usize) -> Result<u8, ()> {
     Ok(read_field(flags_ptr as *const u8))
 }
 
+/// Parse ETH + IPv4 + TCP with a single bounds check that satisfies the eBPF verifier.
+/// Returns (ip_ptr, l4_offset).
+///
+/// Uses a **constant** L4 offset of 34 (ETH_HDR_LEN + 20) and rejects packets
+/// with IP options (IHL != 5). This avoids variable-offset packet accesses
+/// which the eBPF verifier cannot track across map lookups and function calls.
+///
+/// The constant offset means the verifier only needs one bounds check:
+/// `data + 54 <= data_end` (ETH 14 + IP 20 + TCP 20).
+pub const L4_OFF: usize = ETH_HDR_LEN + 20; // 34
+
+#[inline(always)]
+pub fn parse_ipv4_tcp_validated(ctx: &XdpContext) -> Result<(*mut Ipv4Hdr, usize), ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+
+    // Single bounds check: ETH (14) + IPv4 (20) + TCP header (20) = 54 bytes.
+    if start + L4_OFF + 20 > end {
+        return Err(());
+    }
+
+    // Check ethertype is IPv4
+    let eth: *const EthHdr = start as *const EthHdr;
+    let proto = u16::from_be(read_field(unsafe { addr_of!((*eth).h_proto) }));
+    if proto != ETH_P_IP {
+        return Err(());
+    }
+
+    let ip: *mut Ipv4Hdr = (start + ETH_HDR_LEN) as *mut Ipv4Hdr;
+
+    let protocol = read_field(unsafe { addr_of!((*ip).protocol) });
+    if protocol != IPPROTO_TCP {
+        return Err(());
+    }
+
+    // Reject non-initial fragments
+    let frag_off = u16::from_be(read_field(unsafe { addr_of!((*ip).frag_off) }));
+    if frag_off & 0x1FFF != 0 {
+        return Err(());
+    }
+
+    // Reject IP options (IHL != 5). This keeps l4_off constant at 34,
+    // which the verifier can track. IP options are extremely rare in practice.
+    let ver_ihl = read_field(unsafe { addr_of!((*ip).ver_ihl) });
+    if ver_ihl & 0x0F != 5 {
+        return Err(());
+    }
+
+    Ok((ip, L4_OFF))
+}
+
 /// Compute the IPv4 header length from the IHL field.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn ipv4_hdrlen(ip: *const Ipv4Hdr) -> usize {
     let ver_ihl = read_field(unsafe { addr_of!((*ip).ver_ihl) });
     ((ver_ihl & 0x0F) as usize) * 4

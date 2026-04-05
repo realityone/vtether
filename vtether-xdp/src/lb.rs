@@ -11,8 +11,7 @@ use aya_ebpf::programs::XdpContext;
 use crate::conntrack::Ipv4CtTuple;
 use crate::csum::{csum_replace2, csum_replace4};
 use crate::parse::{
-    ptr_at, read_field, write_field, Ipv4Hdr, IPV4_DADDR_OFF, IPV4_SADDR_OFF, TCP_CSUM_OFF,
-    TCP_DPORT_OFF, TCP_SPORT_OFF,
+    ptr_at, read_field, write_field, Ipv4Hdr, TCP_CSUM_OFF, TCP_DPORT_OFF, TCP_SPORT_OFF,
 };
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -181,11 +180,15 @@ pub fn lb4_select_backend_id(key: &Lb4Key, svc: &Lb4Service) -> u32 {
         return 0;
     }
 
+    let count = svc.count as u32;
+    if count == 0 {
+        unsafe { core::hint::unreachable_unchecked() };
+    }
     let rand = unsafe { aya_ebpf::helpers::bpf_get_prandom_u32() };
-    let slot = (rand % svc.count as u32) + 1;
+    let slot = (rand % count) + 1;
 
     // Look up the backend slot entry in the service map.
-    let mut slot_key = Lb4Key {
+    let slot_key = Lb4Key {
         address: key.address,
         dport: key.dport,
         backend_slot: slot as u16,

@@ -19,8 +19,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use crate::conntrack::Ipv4CtTuple;
 use crate::csum::{csum_replace2, csum_replace4};
 use crate::parse::{
-    ptr_at, read_field, write_field, Ipv4Hdr, IPV4_DADDR_OFF, IPV4_SADDR_OFF, TCP_CSUM_OFF,
-    TCP_DPORT_OFF, TCP_SPORT_OFF,
+    ptr_at, read_field, write_field, Ipv4Hdr, TCP_CSUM_OFF, TCP_DPORT_OFF, TCP_SPORT_OFF,
 };
 
 /// Maximum SNAT port allocation retries.
@@ -157,11 +156,13 @@ fn snat_v4_make_rev_key(
 #[inline(always)]
 fn snat_try_keep_port(min_port: u16, max_port: u16, port: u16) -> u16 {
     if port >= min_port && port <= max_port {
-        port
-    } else {
-        // Clamp: use the port modulo the range
-        min_port + (port % (max_port - min_port + 1))
+        return port;
     }
+    let range = (max_port - min_port) as u32 + 1;
+    if range == 0 {
+        unsafe { core::hint::unreachable_unchecked() };
+    }
+    min_port + (port as u32 % range) as u16
 }
 
 /// Clamp a port to the ephemeral range, wrapping on overflow.
@@ -170,10 +171,13 @@ fn snat_try_keep_port(min_port: u16, max_port: u16, port: u16) -> u16 {
 #[inline(always)]
 fn snat_clamp_port_range(min_port: u16, max_port: u16, port: u16) -> u16 {
     if port >= min_port && port <= max_port {
-        port
-    } else {
-        min_port + (port % (max_port - min_port + 1))
+        return port;
     }
+    let range = (max_port - min_port) as u32 + 1;
+    if range == 0 {
+        unsafe { core::hint::unreachable_unchecked() };
+    }
+    min_port + (port as u32 % range) as u16
 }
 
 /// Allocate a new SNAT mapping (forward + reverse entries).
