@@ -1,6 +1,6 @@
 # vtether
 
-eBPF/XDP-based TCP/UDP port forwarder with full NAT (DNAT + SNAT).
+eBPF/XDP-based TCP port forwarder with full NAT (DNAT + SNAT).
 
 ## Install
 
@@ -32,25 +32,26 @@ systemctl stop vtether
 ```yaml
 interface: eth0
 # snat_ip: "192.168.1.100"  # optional, auto-detected from interface
+# conntrack_size: 131072     # max conntrack entries
+# snat_min_port: 32768       # SNAT source port range
+# snat_max_port: 60999
 
 routes:
-  - protocol: tcp
-    port: 443
+  - port: 443
     to: "10.0.0.1:443"
-  - protocol: udp
-    port: 53
-    to: "10.0.0.2:53"
   - port: 8080
     to: "10.0.0.3:8080"
 ```
 
-| Field       | Description                                              |
-|-------------|----------------------------------------------------------|
-| `interface` | Network interface to attach XDP program to               |
-| `snat_ip`   | Source IP for SNAT (optional, auto-detected from interface)|
-| `protocol`  | `tcp` or `udp` (optional, defaults to `tcp`)             |
-| `port`      | Listen port on the interface                             |
-| `to`        | Backend address and port to forward traffic to           |
+| Field            | Description                                                |
+|------------------|------------------------------------------------------------|
+| `interface`      | Network interface to attach XDP program to                 |
+| `snat_ip`        | Source IP for SNAT (optional, auto-detected from interface)|
+| `conntrack_size` | Max conntrack entries (default: 131072)                    |
+| `snat_min_port`  | Minimum SNAT source port (default: 32768)                 |
+| `snat_max_port`  | Maximum SNAT source port (default: 60999)                 |
+| `port`           | Listen port on the interface                               |
+| `to`             | Backend address and port to forward traffic to             |
 
 ## Usage
 
@@ -59,7 +60,7 @@ routes:
 vtether proxy up --config vtether.yaml
 
 # Stop forwarding
-vtether proxy down
+vtether proxy destroy
 
 # Show active routes and metrics
 vtether inspect
