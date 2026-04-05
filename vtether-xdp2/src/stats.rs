@@ -33,22 +33,23 @@ pub fn update_route_stats(rev_nat_index: u16, pkt_len: u64, new_conn: bool) {
         rev_nat_index,
         _pad: 0,
     };
-    if let Some(stats) = ROUTE_STATS.get_ptr_mut(&key) {
-        unsafe {
+    match ROUTE_STATS.get_ptr_mut(&key) {
+        Some(stats) => unsafe {
             (*stats).packets += 1;
             (*stats).bytes += pkt_len;
             if new_conn {
                 (*stats).connections += 1;
             }
+        },
+        None => {
+            let stats = RouteStats {
+                connections: u64::from(new_conn),
+                packets: 1,
+                bytes: pkt_len,
+                drops: 0,
+            };
+            let _ = ROUTE_STATS.insert(&key, &stats, 0);
         }
-    } else {
-        let stats = RouteStats {
-            connections: if new_conn { 1 } else { 0 },
-            packets: 1,
-            bytes: pkt_len,
-            drops: 0,
-        };
-        let _ = ROUTE_STATS.insert(&key, &stats, 0);
     }
 }
 
@@ -59,15 +60,11 @@ pub fn update_route_drops(rev_nat_index: u16) {
         rev_nat_index,
         _pad: 0,
     };
-    if let Some(stats) = ROUTE_STATS.get_ptr_mut(&key) {
-        unsafe { (*stats).drops += 1 };
-    } else {
-        let stats = RouteStats {
-            connections: 0,
-            packets: 0,
-            bytes: 0,
-            drops: 1,
-        };
-        let _ = ROUTE_STATS.insert(&key, &stats, 0);
+    match ROUTE_STATS.get_ptr_mut(&key) {
+        Some(stats) => unsafe { (*stats).drops += 1 },
+        None => {
+            let stats = RouteStats { connections: 0, packets: 0, bytes: 0, drops: 1 };
+            let _ = ROUTE_STATS.insert(&key, &stats, 0);
+        }
     }
 }

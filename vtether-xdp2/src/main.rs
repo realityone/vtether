@@ -50,10 +50,8 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
 
     // Guard against redirect-to-self loop on virtio_net.
     // If saddr == SNAT_IP, this is a forwarded packet that re-entered XDP.
-    if let Some(snat_cfg) = SNAT_CONFIG.get(0) {
-        if tuple.saddr == snat_cfg.snat_addr {
-            return Ok(pass);
-        }
+    if matches!(SNAT_CONFIG.get(0), Some(cfg) if tuple.saddr == cfg.snat_addr) {
+        return Ok(pass);
     }
 
     let mut key = Lb4Key {
@@ -66,11 +64,10 @@ fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     };
     lb4_fill_key(&mut key, &tuple);
 
-    if let Some(svc) = lb4_lookup_service(&key) {
-        return handle_forward(ctx, ip, l4_off, tcp_flags, &tuple, &key, svc);
+    match lb4_lookup_service(&key) {
+        Some(svc) => handle_forward(ctx, ip, l4_off, tcp_flags, &tuple, &key, svc),
+        None => handle_reply(ctx, ip, l4_off, tcp_flags),
     }
-
-    handle_reply(ctx, ip, l4_off, tcp_flags)
 }
 
 #[inline(always)]

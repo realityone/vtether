@@ -59,13 +59,11 @@ enum CtAction {
 
 #[inline(always)]
 fn ct_tcp_select_action(flags: u8) -> CtAction {
-    if flags & (TCP_RST | TCP_FIN) != 0 {
-        return CtAction::Close;
+    match () {
+        () if flags & (TCP_RST | TCP_FIN) != 0 => CtAction::Close,
+        () if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 => CtAction::Create,
+        () => CtAction::Unspec,
     }
-    if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-        return CtAction::Create;
-    }
-    CtAction::Unspec
 }
 
 // ---- Timeout constants (nanoseconds) ----
@@ -184,10 +182,9 @@ fn ct_update_timeout(entry: *mut CtEntry, lifetime_ns: u64, dir: u8, tcp_flags: 
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
     unsafe { (*entry).lifetime = now + lifetime_ns };
 
-    if dir == CT_INGRESS {
-        unsafe { (*entry).rx_flags_seen |= tcp_flags };
-    } else {
-        unsafe { (*entry).tx_flags_seen |= tcp_flags };
+    match dir {
+        CT_INGRESS => unsafe { (*entry).rx_flags_seen |= tcp_flags },
+        _ => unsafe { (*entry).tx_flags_seen |= tcp_flags },
     }
 }
 
@@ -238,23 +235,14 @@ fn ct_lookup_inner(
         }
         CtAction::Close => {
             let entry_ref = unsafe { &*entry_ptr };
-            if dir == CT_SERVICE {
-                unsafe {
-                    (*entry_ptr).closing = CLOSING_RX | CLOSING_TX;
-                }
-            } else if !ct_entry_seen_both_syns(entry_ref) && (tcp_flags & TCP_RST != 0) {
-                unsafe {
-                    (*entry_ptr).closing = CLOSING_RX | CLOSING_TX;
-                }
-            } else if dir == CT_INGRESS {
-                unsafe {
-                    (*entry_ptr).closing |= CLOSING_RX;
-                }
-            } else {
-                unsafe {
-                    (*entry_ptr).closing |= CLOSING_TX;
-                }
-            }
+            let both = CLOSING_RX | CLOSING_TX;
+            let closing_bits = match dir {
+                CT_SERVICE => both,
+                _ if !ct_entry_seen_both_syns(entry_ref) && (tcp_flags & TCP_RST != 0) => both,
+                CT_INGRESS => CLOSING_RX,
+                _ => CLOSING_TX,
+            };
+            unsafe { (*entry_ptr).closing |= closing_bits };
 
             ct_state.closing = true;
 
@@ -293,8 +281,14 @@ pub fn ct_create4(tuple: &Ipv4CtTuple, ct_state: &CtState) -> Result<(), ()> {
         rev_nat_index: ct_state.rev_nat_index,
         closing: 0,
         seen_non_syn: 0,
-        tx_flags_seen: if tuple.flags & CT_INGRESS == 0 { TCP_SYN } else { 0 },
-        rx_flags_seen: if tuple.flags & CT_INGRESS != 0 { TCP_SYN } else { 0 },
+        tx_flags_seen: match tuple.flags & CT_INGRESS {
+            0 => TCP_SYN,
+            _ => 0,
+        },
+        rx_flags_seen: match tuple.flags & CT_INGRESS {
+            0 => 0,
+            _ => TCP_SYN,
+        },
         _pad: [0; 2],
         lifetime: now + CT_SYN_TIMEOUT_NS,
         tx_packets: 0,

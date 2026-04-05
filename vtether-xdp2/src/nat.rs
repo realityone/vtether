@@ -157,11 +157,12 @@ fn snat_v4_new_mapping(
             return Ok(snat_port_be);
         }
 
-        port = if i == 0 {
-            let rand = unsafe { aya_ebpf::helpers::bpf_get_prandom_u32() } as u16;
-            snat_clamp_port_range(target.min_port, target.max_port, rand)
-        } else {
-            snat_clamp_port_range(target.min_port, target.max_port, port + 1)
+        port = match i {
+            0 => {
+                let rand = unsafe { aya_ebpf::helpers::bpf_get_prandom_u32() } as u16;
+                snat_clamp_port_range(target.min_port, target.max_port, rand)
+            }
+            _ => snat_clamp_port_range(target.min_port, target.max_port, port + 1),
         };
 
         i += 1;
