@@ -782,45 +782,6 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
         let _ = ct4.remove(key);
     }
 
-    // ---- Phase 1.5: Purge orphan CT entries whose counterpart is gone ----
-    //
-    // Each connection has two CT entries (forward CT_SERVICE + reverse CT_EGRESS).
-    // When the reverse entry expires (short close timeout after FIN/RST), the
-    // forward service entry may still have a 6h established timeout. Delete it
-    // since the connection is dead.
-    //
-    // For each remaining CT entry, check if its counterpart exists. The counterpart
-    // has swapped saddr/daddr, swapped sport/dport, and different flags.
-    let mut orphan_ct_keys: Vec<Ipv4CtTuple> = Vec::new();
-    for item in ct4.iter() {
-        if let Ok((key, _val)) = item {
-            let counterpart = Ipv4CtTuple {
-                daddr: key.saddr,
-                saddr: key.daddr,
-                dport: key.sport,
-                sport: key.dport,
-                nexthdr: key.nexthdr,
-                // Forward (CT_SERVICE=4) <-> Reverse (CT_EGRESS=0)
-                flags: match key.flags {
-                    0x04 => 0x00, // CT_EGRESS|CT_SERVICE -> CT_EGRESS
-                    _ => 0x04,    // CT_EGRESS -> CT_EGRESS|CT_SERVICE
-                },
-            };
-            if ct4.get(&counterpart, 0).is_err() {
-                orphan_ct_keys.push(key);
-            }
-        }
-    }
-    if !orphan_ct_keys.is_empty() {
-        info!(
-            "gc: purging {} orphan CT entries (counterpart gone)",
-            orphan_ct_keys.len()
-        );
-    }
-    for key in &orphan_ct_keys {
-        let _ = ct4.remove(key);
-    }
-
     // ---- Phase 2: Purge orphan SNAT entries ----
     // Cilium (ctmap.go:611-713 PurgeOrphanNATEntries):
     //   For each SNAT entry, construct the corresponding CT key.
