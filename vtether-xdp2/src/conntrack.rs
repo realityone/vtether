@@ -59,11 +59,13 @@ enum CtAction {
 
 #[inline(always)]
 fn ct_tcp_select_action(flags: u8) -> CtAction {
-    match () {
-        () if flags & (TCP_RST | TCP_FIN) != 0 => CtAction::Close,
-        () if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 => CtAction::Create,
-        () => CtAction::Unspec,
+    if flags & (TCP_RST | TCP_FIN) != 0 {
+        return CtAction::Close;
     }
+    if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+        return CtAction::Create;
+    }
+    CtAction::Unspec
 }
 
 // ---- Timeout constants (nanoseconds) ----
