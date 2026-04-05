@@ -19,6 +19,10 @@ interface: {default_iface}
 # Max conntrack entries (default: 131072)
 # conntrack_size: 131072
 
+# SNAT source port range (default: 32768-60999)
+# snat_min_port: 32768
+# snat_max_port: 60999
+
 # TCP forwarding routes
 # routes:
 #   - port: 443

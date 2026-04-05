@@ -40,12 +40,26 @@ pub struct Config {
     /// Max conntrack entries (default: 131072)
     #[serde(default = "default_conntrack_size")]
     pub conntrack_size: u32,
+    /// Minimum SNAT source port (default: 32768)
+    #[serde(default = "default_snat_min_port")]
+    pub snat_min_port: u16,
+    /// Maximum SNAT source port (default: 60999)
+    #[serde(default = "default_snat_max_port")]
+    pub snat_max_port: u16,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 }
 
 fn default_conntrack_size() -> u32 {
     131_072
+}
+
+fn default_snat_min_port() -> u16 {
+    32768
+}
+
+fn default_snat_max_port() -> u16 {
+    60999
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,8 +280,8 @@ pub async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result
             0,
             SnatConfig {
                 snat_addr: snat_ip_be,
-                min_port: 32768,
-                max_port: 60999,
+                min_port: config.snat_min_port,
+                max_port: config.snat_max_port,
             },
             0,
         )?;
