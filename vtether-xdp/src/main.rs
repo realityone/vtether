@@ -43,24 +43,16 @@ pub fn vtether_xdp(ctx: XdpContext) -> u32 {
 fn try_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     let pass = aya_ebpf::bindings::xdp_action::XDP_PASS;
 
-    // Parse once at the top. Requires IHL==5, so L4_OFF=34 is constant.
     let (ip, l4_off) = parse::parse_ipv4_tcp_validated(ctx)?;
     let tuple = parse::extract_tuple(ctx, ip, l4_off)?;
     let tcp_flags = load_tcp_flags(ctx, l4_off)?;
 
-    // Guard against redirect-to-self loop on virtio_net.
-    // If saddr == SNAT_IP, this is a forwarded packet that re-entered XDP.
     if matches!(SNAT_CONFIG.get(0), Some(cfg) if tuple.saddr == cfg.snat_addr) {
         return Ok(pass);
     }
 
     let mut key = Lb4Key {
-        address: 0,
-        dport: 0,
-        backend_slot: 0,
-        proto: 0,
-        scope: 0,
-        _pad: [0; 2],
+        address: 0, dport: 0, backend_slot: 0, proto: 0, scope: 0, _pad: [0; 2],
     };
     lb4_fill_key(&mut key, &tuple);
 
@@ -83,12 +75,9 @@ fn handle_forward(
     let drop = aya_ebpf::bindings::xdp_action::XDP_DROP;
 
     let fwd_tuple = Ipv4CtTuple {
-        daddr: orig_tuple.daddr,
-        saddr: orig_tuple.saddr,
-        dport: orig_tuple.dport,
-        sport: orig_tuple.sport,
-        nexthdr: IPPROTO_TCP,
-        flags: CT_EGRESS | CT_SERVICE,
+        daddr: orig_tuple.daddr, saddr: orig_tuple.saddr,
+        dport: orig_tuple.dport, sport: orig_tuple.sport,
+        nexthdr: IPPROTO_TCP, flags: CT_EGRESS | CT_SERVICE,
     };
 
     let mut ct_state = CtState::new();
@@ -114,6 +103,7 @@ fn handle_forward(
                     stats::update_route_drops(svc.rev_nat_index);
                     return Ok(drop);
                 }
+                // Log only new connections (not per-packet)
                 info!(ctx, "FWD: NEW conn, backend_id={}", backend_id);
                 (backend_id, true)
             }
@@ -136,51 +126,29 @@ fn handle_forward(
 
     // DNAT
     lb::lb4_xlate_dnat(ctx, ip, l4_off, old_daddr, backend.address, old_dport, backend.port)?;
-    info!(ctx, "FWD: DNAT done");
 
     // Reverse CT entry for reply path
     let rev_ct_tuple = Ipv4CtTuple {
-        daddr: old_saddr,
-        saddr: backend.address,
-        dport: old_sport,
-        sport: backend.port,
-        nexthdr: IPPROTO_TCP,
-        flags: CT_EGRESS,
+        daddr: old_saddr, saddr: backend.address,
+        dport: old_sport, sport: backend.port,
+        nexthdr: IPPROTO_TCP, flags: CT_EGRESS,
     };
     let rev_ct_state = CtState {
-        rev_nat_index: svc.rev_nat_index,
-        backend_id,
-        closing: false,
-        syn: false,
+        rev_nat_index: svc.rev_nat_index, backend_id, closing: false, syn: false,
     };
     let _ = ct_create4(&rev_ct_tuple, &rev_ct_state);
 
     // SNAT
     let snat_cfg = SNAT_CONFIG.get(0).ok_or(())?;
     let target = SnatTarget {
-        addr: snat_cfg.snat_addr,
-        min_port: snat_cfg.min_port,
-        max_port: snat_cfg.max_port,
+        addr: snat_cfg.snat_addr, min_port: snat_cfg.min_port, max_port: snat_cfg.max_port,
     };
-    let snat_port = nat::snat_v4_nat(
-        ctx,
-        ip,
-        l4_off,
-        old_saddr,
-        old_sport,
-        backend.address,
-        backend.port,
-        &target,
-    )?;
-    info!(ctx, "FWD: SNAT done, port=0x{:x}", snat_port);
+    nat::snat_v4_nat(ctx, ip, l4_off, old_saddr, old_sport, backend.address, backend.port, &target)?;
 
-    // Stats -- read tot_len from the (already rewritten) IP header
+    // Stats
     let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
     stats::update_route_stats(svc.rev_nat_index, pkt_len, is_new);
 
-    // XDP_PASS: let the kernel stack forward the rewritten packet.
-    // No FIB redirect -- avoids redirect-to-self loop on virtio_net.
-    info!(ctx, "FWD: passing to kernel for routing");
     Ok(aya_ebpf::bindings::xdp_action::XDP_PASS)
 }
 
@@ -193,56 +161,36 @@ fn handle_reply(
 ) -> Result<u32, ()> {
     let pass = aya_ebpf::bindings::xdp_action::XDP_PASS;
 
-    // Reverse SNAT: restore original client IP:port as destination
     let (client_ip, client_port) = match nat::snat_v4_rev_nat(ctx, ip, l4_off) {
-        Ok(result) => {
-            info!(ctx, "REPLY: revSNAT ok");
-            result
-        }
+        Ok(result) => result,
         Err(()) => return Ok(pass),
     };
 
-    // After revSNAT, read backend IP:port from source fields.
-    // No re-parse needed -- ip pointer is still valid since we return XDP_PASS.
     let backend_ip = read_field(unsafe { addr_of!((*ip).saddr) });
-    let backend_port = read_field(
-        parse::ptr_at::<u16>(ctx, l4_off + parse::TCP_SPORT_OFF)? as *const u16,
-    );
+    let backend_port =
+        read_field(parse::ptr_at::<u16>(ctx, l4_off + parse::TCP_SPORT_OFF)? as *const u16);
 
-    // CT lookup for the reverse direction
     let rev_lookup_tuple = Ipv4CtTuple {
-        daddr: client_ip,
-        saddr: backend_ip,
-        dport: client_port,
-        sport: backend_port,
-        nexthdr: IPPROTO_TCP,
-        flags: CT_EGRESS,
+        daddr: client_ip, saddr: backend_ip,
+        dport: client_port, sport: backend_port,
+        nexthdr: IPPROTO_TCP, flags: CT_EGRESS,
     };
 
     let mut ct_state = CtState::new();
     match ct_lazy_lookup4(tcp_flags, &rev_lookup_tuple, CT_INGRESS, &mut ct_state) {
-        CtStatus::New => {
-            info!(ctx, "REPLY: CT miss, passing");
-            return Ok(pass);
-        }
-        CtStatus::Established | CtStatus::Reply => {
-            info!(ctx, "REPLY: CT hit, rev_nat_index={}", ct_state.rev_nat_index);
-        }
+        CtStatus::New => return Ok(pass),
+        CtStatus::Established | CtStatus::Reply => {}
     }
 
-    // Reverse DNAT: restore original VIP as source
     if ct_state.rev_nat_index != 0 {
         lb::lb4_rev_nat(ctx, ip, l4_off, ct_state.rev_nat_index)?;
-        info!(ctx, "REPLY: revDNAT done");
     }
 
-    // Stats
     let pkt_len = u16::from_be(read_field(unsafe { addr_of!((*ip).tot_len) })) as u64;
     if ct_state.rev_nat_index != 0 {
         stats::update_route_stats(ct_state.rev_nat_index, pkt_len, false);
     }
 
-    info!(ctx, "REPLY: passing to kernel for routing");
     Ok(pass)
 }
 
