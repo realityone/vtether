@@ -10,16 +10,7 @@ mod proxy;
 mod setup;
 
 const DEFAULT_PIN_PATH: &str = "/sys/fs/bpf/vtether";
-const DEFAULT_CONFIG_PATH: &str = "/etc/vtether/config.yaml";
-const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
 const STATE_BASE_DIR: &str = "/run/vtether";
-
-const IPPROTO_TCP: u8 = 6;
-
-// Adaptive GC interval bounds
-const GC_INTERVAL_MIN_SECS: u64 = 10;
-const GC_INTERVAL_MAX_SECS: u64 = 300;
-const GC_INTERVAL_DEFAULT_SECS: u64 = 30;
 
 // ---- CLI ----
 
@@ -60,7 +51,7 @@ enum ProxyAction {
     /// Start forwarding with the given config
     Up {
         /// Path to YAML config file
-        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        #[arg(short, long, default_value = setup::DEFAULT_CONFIG_PATH)]
         config: PathBuf,
 
         /// bpffs pin path for persisting the eBPF program
@@ -74,22 +65,6 @@ enum ProxyAction {
         pin_path: PathBuf,
     },
 }
-
-// ---- Map pin names ----
-
-const MAP_PINS: &[(&str, &str)] = &[
-    ("LB4_SERVICES", "lb4_services"),
-    ("LB4_BACKENDS", "lb4_backends"),
-    ("LB4_REVERSE_NAT", "lb4_reverse_nat"),
-    ("SNAT_CONFIG", "snat_config"),
-    ("CT4", "ct4"),
-    ("SNAT4", "snat4"),
-    ("ROUTE_STATS", "route_stats"),
-];
-
-/// SNAT tuple direction flags (must match vtether-xdp nat.rs).
-const TUPLE_F_IN: u8 = 1;
-const TUPLE_F_SERVICE: u8 = 4;
 
 // ---- Main ----
 

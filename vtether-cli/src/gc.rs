@@ -3,7 +3,16 @@ use aya::maps::{HashMap, Map, MapData};
 use anyhow::Context as _;
 use log::info;
 
-use crate::{GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS, IPPROTO_TCP, TUPLE_F_IN, TUPLE_F_SERVICE};
+pub const IPPROTO_TCP: u8 = 6;
+
+// Adaptive GC interval bounds
+pub const GC_INTERVAL_MIN_SECS: u64 = 10;
+pub const GC_INTERVAL_MAX_SECS: u64 = 300;
+pub const GC_INTERVAL_DEFAULT_SECS: u64 = 30;
+
+/// SNAT tuple direction flags (must match vtether-xdp nat.rs).
+const TUPLE_F_IN: u8 = 1;
+const TUPLE_F_SERVICE: u8 = 4;
 
 // ---- BPF map types for conntrack (must match vtether-xdp eBPF layout exactly) ----
 

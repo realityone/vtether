@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 
-use crate::{DEFAULT_CONFIG_PATH, SYSTEMD_UNIT_PATH};
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/vtether/config.yaml";
+const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
 
 fn get_default_interface() -> anyhow::Result<String> {
     let output = std::process::Command::new("ip")

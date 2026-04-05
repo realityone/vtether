@@ -9,13 +9,26 @@ use log::info;
 use serde::Deserialize;
 
 use crate::{
-    IPPROTO_TCP, MAP_PINS,
-    gc::{adapt_gc_interval, reap_conntrack},
+    gc::{
+        IPPROTO_TCP, GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS,
+        adapt_gc_interval, reap_conntrack,
+    },
     get_interface_ipv4,
     setup::setup_sysctl,
     state_dir_for,
-    GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS,
 };
+
+// ---- Map pin names ----
+
+const MAP_PINS: &[(&str, &str)] = &[
+    ("LB4_SERVICES", "lb4_services"),
+    ("LB4_BACKENDS", "lb4_backends"),
+    ("LB4_REVERSE_NAT", "lb4_reverse_nat"),
+    ("SNAT_CONFIG", "snat_config"),
+    ("CT4", "ct4"),
+    ("SNAT4", "snat4"),
+    ("ROUTE_STATS", "route_stats"),
+];
 
 // ---- Config ----
 
