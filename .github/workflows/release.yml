@@ -55,8 +55,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Download artifacts
         uses: actions/download-artifact@v5
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${{ github.ref_name }}$" | head -n1)
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG=$(git log "${PREV_TAG}..${{ github.ref_name }}" --pretty=format:"- %s" --no-merges)
+          else
+            CHANGELOG=$(git log "${{ github.ref_name }}" --pretty=format:"- %s" --no-merges)
+          fi
+          # Write to file to preserve newlines
+          echo "$CHANGELOG" > /tmp/changelog.md
 
       - name: Create release
         env:
@@ -66,4 +83,5 @@ jobs:
             vtether-linux-amd64/vtether-linux-amd64 \
             vtether-linux-arm64/vtether-linux-arm64 \
             --repo ${{ github.repository }} \
-            --generate-notes
+            --title "${{ github.ref_name }}" \
+            --notes-file /tmp/changelog.md
