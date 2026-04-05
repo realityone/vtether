@@ -48,6 +48,10 @@ enum Commands {
         /// bpffs pin path used during `proxy up`
         #[arg(long, default_value = DEFAULT_PIN_PATH)]
         pin_path: PathBuf,
+
+        /// Show detailed CT and SNAT entries
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -238,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
             print_version();
             Ok(())
         }
-        Commands::Inspect { pin_path } => inspect(pin_path),
+        Commands::Inspect { pin_path, verbose } => inspect(pin_path, verbose),
     }
 }
 
@@ -752,7 +756,7 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     }
 
     let map_data = MapData::from_pin(&ct4_path).context("failed to load pinned CT4")?;
-    let map = Map::HashMap(map_data);
+    let map = Map::LruHashMap(map_data);
     let mut ct4: HashMap<_, Ipv4CtTuple, CtEntry> =
         HashMap::try_from(map).context("failed to parse CT4 map")?;
 
@@ -790,7 +794,7 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     if snat4_path.exists() {
         let snat_map_data =
             MapData::from_pin(&snat4_path).context("failed to load pinned SNAT4")?;
-        let snat_map = Map::HashMap(snat_map_data);
+        let snat_map = Map::LruHashMap(snat_map_data);
         let mut snat4: HashMap<_, Ipv4CtTuple, SnatEntry> =
             HashMap::try_from(snat_map).context("failed to parse SNAT4 map")?;
 
@@ -912,7 +916,7 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
+fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
     let prog_pin = pin_path.join("prog");
     anyhow::ensure!(
         prog_pin.exists(),
@@ -1007,22 +1011,164 @@ fn inspect(pin_path: PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    // Count active CT entries
+    // CT entries
     let ct4_path = pin_path.join("ct4");
     if ct4_path.exists() {
-        match (|| -> anyhow::Result<usize> {
+        match (|| -> anyhow::Result<Vec<(Ipv4CtTuple, CtEntry)>> {
             let map_data = MapData::from_pin(&ct4_path).context("failed to load pinned CT4")?;
-            let map = Map::HashMap(map_data);
+            let map = Map::LruHashMap(map_data);
             let ct4: HashMap<_, Ipv4CtTuple, CtEntry> =
                 HashMap::try_from(map).context("failed to parse CT4 map")?;
-            Ok(ct4.iter().filter(|i| i.is_ok()).count())
+            Ok(ct4.iter().filter_map(|i| i.ok()).collect())
         })() {
-            Ok(count) => println!("\nActive connections: {} (CT entries / 2)", count),
+            Ok(entries) => {
+                println!("\nActive connections: {} (CT entries / 2)", entries.len());
+                if verbose {
+                    let now = ktime_get_ns();
+                    println!("\nCT4 entries ({}):", entries.len());
+                    for (tuple, entry) in &entries {
+                        print_ct_entry(tuple, entry, now);
+                    }
+                }
+            }
             Err(e) => println!("\nActive connections: unknown ({:#})", e),
         }
     }
 
+    // SNAT entries (verbose only)
+    if verbose {
+        let snat4_path = pin_path.join("snat4");
+        if snat4_path.exists() {
+            match (|| -> anyhow::Result<Vec<(Ipv4CtTuple, SnatEntry)>> {
+                let map_data =
+                    MapData::from_pin(&snat4_path).context("failed to load pinned SNAT4")?;
+                let map = Map::LruHashMap(map_data);
+                let snat4: HashMap<_, Ipv4CtTuple, SnatEntry> =
+                    HashMap::try_from(map).context("failed to parse SNAT4 map")?;
+                Ok(snat4.iter().filter_map(|i| i.ok()).collect())
+            })() {
+                Ok(entries) => {
+                    println!("\nSNAT4 entries ({}):", entries.len());
+                    for (tuple, entry) in &entries {
+                        print_snat_entry(tuple, entry);
+                    }
+                }
+                Err(e) => println!("\nSNAT4: unknown ({:#})", e),
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn ct_flags_str(flags: u8) -> String {
+    const TCP_FLAGS: &[(u8, &str)] = &[
+        (0x01, "FIN"),
+        (0x02, "SYN"),
+        (0x04, "RST"),
+        (0x08, "PSH"),
+        (0x10, "ACK"),
+    ];
+    let parts: Vec<&str> = TCP_FLAGS
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join("|")
+    }
+}
+
+fn ct_dir_str(flags: u8) -> &'static str {
+    match flags {
+        0 => "EGRESS",
+        1 => "INGRESS",
+        4 => "EGRESS|SERVICE",
+        5 => "INGRESS|SERVICE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn closing_str(closing: u8) -> String {
+    let mut parts = Vec::new();
+    if closing & 0x01 != 0 {
+        parts.push("RX");
+    }
+    if closing & 0x02 != 0 {
+        parts.push("TX");
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join("|")
+    }
+}
+
+fn format_duration_human(secs: f64) -> String {
+    let abs = secs.abs();
+    if abs >= 3600.0 {
+        format!("{:.1}h", secs / 3600.0)
+    } else if abs >= 60.0 {
+        format!("{:.0}m", secs / 60.0)
+    } else {
+        format!("{:.0}s", secs)
+    }
+}
+
+fn print_ct_entry(tuple: &Ipv4CtTuple, entry: &CtEntry, now_ns: u64) {
+    let saddr = Ipv4Addr::from(u32::from_be(tuple.saddr));
+    let daddr = Ipv4Addr::from(u32::from_be(tuple.daddr));
+    let sport = u16::from_be(tuple.sport);
+    let dport = u16::from_be(tuple.dport);
+
+    let remaining_s = (entry.lifetime as f64 - now_ns as f64) / 1e9;
+    let status = if remaining_s > 0.0 { "ALIVE" } else { "EXPIRED" };
+
+    println!(
+        "  {}:{} -> {}:{}  dir={}  [{}]",
+        saddr,
+        sport,
+        daddr,
+        dport,
+        ct_dir_str(tuple.flags),
+        status,
+    );
+    println!(
+        "    backend_id={}  rev_nat={}  closing={}  seen_non_syn={}",
+        entry.backend_id,
+        entry.rev_nat_index,
+        closing_str(entry.closing),
+        entry.seen_non_syn,
+    );
+    println!(
+        "    tx_flags={}  rx_flags={}  expires in {}",
+        ct_flags_str(entry.tx_flags_seen),
+        ct_flags_str(entry.rx_flags_seen),
+        format_duration_human(remaining_s),
+    );
+}
+
+fn print_snat_entry(tuple: &Ipv4CtTuple, entry: &SnatEntry) {
+    let saddr = Ipv4Addr::from(u32::from_be(tuple.saddr));
+    let daddr = Ipv4Addr::from(u32::from_be(tuple.daddr));
+    let sport = u16::from_be(tuple.sport);
+    let dport = u16::from_be(tuple.dport);
+
+    let dir = match tuple.flags {
+        0 => "OUT",
+        1 => "IN",
+        _ => "???",
+    };
+
+    let to_addr = Ipv4Addr::from(u32::from_be(entry.to_addr));
+    let to_port = u16::from_be(entry.to_port);
+
+    println!(
+        "  {}:{} -> {}:{}  dir={}  => {}:{}",
+        saddr, sport, daddr, dport, dir, to_addr, to_port,
+    );
 }
 
 fn aggregate_stats(per_cpu: PerCpuValues<RouteStats>) -> RouteStats {

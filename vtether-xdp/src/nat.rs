@@ -4,7 +4,7 @@
 /// - `bpf/lib/nat.h` -- `__snat_v4_nat()`, `snat_v4_new_mapping()`,
 ///   `snat_v4_rewrite_headers()`, `snat_v4_rev_nat()`
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::HashMap;
+use aya_ebpf::maps::LruHashMap;
 use aya_ebpf::programs::XdpContext;
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -46,7 +46,7 @@ pub struct SnatTarget {
 // ---- SNAT map ----
 
 #[map]
-pub static SNAT4: HashMap<SnatKey, SnatEntry> = HashMap::with_max_entries(131072, 0);
+pub static SNAT4: LruHashMap<SnatKey, SnatEntry> = LruHashMap::with_max_entries(131072, 0);
 
 // ---- SNAT key construction ----
 

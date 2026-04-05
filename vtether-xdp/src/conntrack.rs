@@ -14,10 +14,10 @@
 ///
 /// Timeout selection (from `ct_update_timeout` in Cilium):
 /// - SYN-only (handshake): `CT_SYN_TIMEOUT` (60s)
-/// - Non-SYN seen (`seen_non_syn`): `CT_CONNECTION_LIFETIME_TCP` (6h)
+/// - Non-SYN seen (`seen_non_syn`): `CT_CONNECTION_LIFETIME_TCP` (2h13m20s)
 /// - After FIN/RST (`closing`): `CT_CLOSE_TIMEOUT` (10s)
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::HashMap;
+use aya_ebpf::maps::LruHashMap;
 
 // ---- CT direction flags (stored in Ipv4CtTuple.flags) ----
 
@@ -70,7 +70,7 @@ fn ct_tcp_select_action(flags: u8) -> CtAction {
 // ---- Timeout constants (nanoseconds) ----
 
 pub const CT_SYN_TIMEOUT_NS: u64 = 60 * 1_000_000_000; // 60s
-pub const CT_ESTABLISHED_TIMEOUT_NS: u64 = 21_600 * 1_000_000_000; // 6 hours
+pub const CT_ESTABLISHED_TIMEOUT_NS: u64 = 8000 * 1_000_000_000; // 2h13m20s (Cilium default)
 pub const CT_CLOSE_TIMEOUT_NS: u64 = 10 * 1_000_000_000; // 10s
 
 // ---- Map key/value types ----
@@ -131,7 +131,7 @@ const CLOSING_TX: u8 = 0x02;
 // ---- Maps ----
 
 #[map]
-pub static CT4: HashMap<Ipv4CtTuple, CtEntry> = HashMap::with_max_entries(131072, 0);
+pub static CT4: LruHashMap<Ipv4CtTuple, CtEntry> = LruHashMap::with_max_entries(131072, 0);
 
 // ---- CT helpers ----
 

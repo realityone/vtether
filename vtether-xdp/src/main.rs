@@ -200,23 +200,25 @@ fn handle_forward(
     }
     debug_debug!(ctx, "FWD: DNAT done");
 
-    // Reverse CT entry for reply path
-    let rev_ct_tuple = Ipv4CtTuple {
-        daddr: old_saddr,
-        saddr: backend.address,
-        dport: old_sport,
-        sport: backend.port,
-        nexthdr: IPPROTO_TCP,
-        flags: CT_EGRESS,
-    };
-    let rev_ct_state = CtState {
-        rev_nat_index: svc.rev_nat_index,
-        backend_id,
-        closing: false,
-        syn: false,
-    };
-    if ct_create4(&rev_ct_tuple, &rev_ct_state).is_err() {
-        debug_warn!(ctx, "FWD: reverse CT create failed (CT map full?)");
+    // Reverse CT entry for reply path (new connections only)
+    if is_new {
+        let rev_ct_tuple = Ipv4CtTuple {
+            daddr: old_saddr,
+            saddr: backend.address,
+            dport: old_sport,
+            sport: backend.port,
+            nexthdr: IPPROTO_TCP,
+            flags: CT_EGRESS,
+        };
+        let rev_ct_state = CtState {
+            rev_nat_index: svc.rev_nat_index,
+            backend_id,
+            closing: false,
+            syn: false,
+        };
+        if ct_create4(&rev_ct_tuple, &rev_ct_state).is_err() {
+            debug_warn!(ctx, "FWD: reverse CT create failed (CT map full?)");
+        }
     }
 
     // SNAT
