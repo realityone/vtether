@@ -651,11 +651,24 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
 }
 
 // ---- Conntrack GC ----
+//
+// Follows Cilium's two-phase GC design (pkg/maps/ctmap/gc/gc.go):
+//   Phase 1: Delete CT entries where `entry.lifetime < now`
+//   Phase 2: Purge orphan SNAT entries whose corresponding CT entry no longer exists
+//
+// The adaptive interval formula matches Cilium's calculateIntervalWithConfig:
+//   >25% deleted: interval = interval * (1 - ratio)  (proportional shrink)
+//   <5% deleted:  interval = interval * 1.5           (grow slowly)
+//   5-25%:        keep unchanged
 
+/// Read kernel monotonic clock (matches bpf_ktime_get_ns in the datapath).
+/// Cilium uses CLOCK_MONOTONIC; bpf_ktime_get_ns() is also CLOCK_MONOTONIC.
 fn ktime_get_ns() -> u64 {
-    let ts = nix::time::ClockId::CLOCK_BOOTTIME
+    // Note: nix doesn't expose CLOCK_MONOTONIC_RAW directly, but
+    // CLOCK_MONOTONIC matches bpf_ktime_get_ns() on Linux.
+    let ts = nix::time::ClockId::CLOCK_MONOTONIC
         .now()
-        .expect("CLOCK_BOOTTIME");
+        .expect("CLOCK_MONOTONIC");
     ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
 }
 
@@ -665,18 +678,31 @@ struct GcResult {
     orphans: u64,
 }
 
+/// Adaptive GC interval matching Cilium's formula.
+///
+/// Cilium (gc.go:579-600):
+///   >25%: `prevInterval * (1.0 - deleteRatio)` (proportional)
+///   <5%:  `prevInterval * 1.5`
+///   else: unchanged
 fn adapt_gc_interval(current_secs: u64, total: u64, expired: u64) -> u64 {
     if total == 0 {
         return current_secs;
     }
-    let ratio = expired * 100 / total;
-    let new_secs = match ratio {
-        26.. => current_secs / 2,
+    let ratio_pct = expired * 100 / total;
+    let new_secs = match ratio_pct {
+        26.. => {
+            // Cilium: interval * (1 - ratio). Cap ratio at 90% like Cilium does.
+            let ratio = (expired as f64 / total as f64).min(0.9);
+            (current_secs as f64 * (1.0 - ratio)) as u64
+        }
         0..5 => current_secs * 3 / 2,
         _ => current_secs,
     };
     new_secs.clamp(GC_INTERVAL_MIN_SECS, GC_INTERVAL_MAX_SECS)
 }
+
+/// SNAT tuple direction flags (must match vtether-xdp nat.rs).
+const TUPLE_F_IN: u8 = 1;
 
 fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     let ct4_path = pin_path.join("ct4");
@@ -692,7 +718,8 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
 
     let now = ktime_get_ns();
 
-    // Phase 1: Expire CT entries whose lifetime has passed.
+    // ---- Phase 1: Expire CT entries whose absolute lifetime has passed ----
+    // Cilium (ctmap.go:551): `if entry.Lifetime < filter.Time { deleteEntry }`
     let mut expired_keys: Vec<Ipv4CtTuple> = Vec::new();
     let mut total: u64 = 0;
     for item in ct4.iter() {
@@ -711,7 +738,10 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
         let _ = ct4.remove(key);
     }
 
-    // Phase 2: Expire SNAT entries (created timestamp + 6h timeout)
+    // ---- Phase 2: Purge orphan SNAT entries ----
+    // Cilium (ctmap.go:611-713 PurgeOrphanNATEntries):
+    //   For each SNAT entry, construct the corresponding CT key.
+    //   If no CT entry exists, the SNAT entry is orphaned — delete it.
     let mut snat_orphans: u64 = 0;
     if snat4_path.exists() {
         let snat_map_data =
@@ -720,25 +750,74 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
         let mut snat4: HashMap<_, Ipv4CtTuple, SnatEntry> =
             HashMap::try_from(snat_map).context("failed to parse SNAT4 map")?;
 
-        // SNAT entries don't have a lifetime field; they're valid as long as
-        // the corresponding CT entry exists. Remove SNAT entries that are older
-        // than 6 hours (CT_ESTABLISHED_TIMEOUT).
-        const SNAT_MAX_AGE_NS: u64 = 21_600 * 1_000_000_000; // 6 hours
-        let mut snat_expired: Vec<Ipv4CtTuple> = Vec::new();
+        let mut orphan_keys: Vec<Ipv4CtTuple> = Vec::new();
         for item in snat4.iter() {
-            if let Ok((key, val)) = item {
-                if now.saturating_sub(val.created) > SNAT_MAX_AGE_NS {
-                    snat_expired.push(key);
+            if let Ok((snat_key, snat_val)) = item {
+                // Construct the CT key that should exist if this SNAT entry is alive.
+                //
+                // For TUPLE_F_OUT (forward SNAT entry):
+                //   SNAT key = {saddr=client, daddr=backend, sport=client_port, dport=backend_port}
+                //   SNAT val = {to_addr=snat_ip, to_port=snat_port}
+                //   Corresponding CT key = forward CT entry (CT_EGRESS|CT_SERVICE):
+                //     {daddr=VIP, saddr=client, dport=svc_port, sport=client_port}
+                //   We can't reconstruct VIP/svc_port from SNAT alone, so instead check
+                //   if the reverse SNAT entry's corresponding CT exists.
+                //
+                // For TUPLE_F_IN (reverse SNAT entry):
+                //   SNAT key = {saddr=snat_ip, daddr=backend, sport=snat_port, dport=backend_port}
+                //   SNAT val = {to_addr=client_ip, to_port=client_port}
+                //   Corresponding CT key = reverse CT entry (CT_EGRESS, used by reply path):
+                //     {daddr=client_ip, saddr=backend_ip, dport=client_port, sport=backend_port}
+                //
+                // Cilium checks if the egress CT entry exists for the connection.
+                // We check the reverse CT entry since it's directly derivable.
+                let ct_key = match snat_key.flags {
+                    TUPLE_F_IN => {
+                        // Reverse SNAT -> check if reverse CT entry exists
+                        Ipv4CtTuple {
+                            daddr: snat_val.to_addr,   // client_ip
+                            saddr: snat_key.daddr,     // backend_ip
+                            dport: snat_val.to_port,   // client_port
+                            sport: snat_key.dport,     // backend_port
+                            nexthdr: IPPROTO_TCP,
+                            flags: 0, // CT_EGRESS (the reverse CT entry created on forward path)
+                        }
+                    }
+                    _ => {
+                        // Forward SNAT -> check if forward SNAT's reverse counterpart exists
+                        // If the reverse SNAT entry is gone, this forward entry is orphaned too.
+                        // Use the reverse SNAT key to check.
+                        Ipv4CtTuple {
+                            saddr: snat_val.to_addr,   // snat_ip
+                            daddr: snat_key.daddr,     // backend_ip
+                            sport: snat_val.to_port,   // snat_port
+                            dport: snat_key.dport,     // backend_port
+                            nexthdr: IPPROTO_TCP,
+                            flags: TUPLE_F_IN,
+                        }
+                    }
+                };
+
+                // Check existence: for TUPLE_F_IN entries, look up CT4.
+                // For TUPLE_F_OUT entries, look up SNAT4 (check if reverse peer exists).
+                let exists = match snat_key.flags {
+                    TUPLE_F_IN => ct4.get(&ct_key, 0).is_ok(),
+                    _ => snat4.get(&ct_key, 0).is_ok(),
+                };
+
+                if !exists {
+                    orphan_keys.push(snat_key);
                 }
             }
         }
-        if !snat_expired.is_empty() {
-            info!("gc: removing {} expired SNAT entries", snat_expired.len());
+
+        if !orphan_keys.is_empty() {
+            info!("gc: purging {} orphan SNAT entries", orphan_keys.len());
         }
-        for key in &snat_expired {
+        for key in &orphan_keys {
             let _ = snat4.remove(key);
         }
-        snat_orphans = snat_expired.len() as u64;
+        snat_orphans = orphan_keys.len() as u64;
     }
 
     Ok(GcResult {
