@@ -7,6 +7,15 @@ on:
     branches: [main]
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --component rustfmt && rustup default nightly
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -25,7 +34,7 @@ jobs:
 
       - name: Install nightly toolchain
         run: |
-          rustup toolchain install nightly --component rust-src
+          rustup toolchain install nightly --component rust-src clippy
           rustup default nightly
           rustup target add ${{ matrix.target }}
 
@@ -40,6 +49,10 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Clippy
+        if: matrix.arch == 'amd64'
+        run: cargo clippy --release --target ${{ matrix.target }} -- -D warnings
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
