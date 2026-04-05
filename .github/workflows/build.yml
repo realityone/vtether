@@ -34,7 +34,7 @@ jobs:
 
       - name: Install nightly toolchain
         run: |
-          rustup toolchain install nightly --component rust-src clippy
+          rustup toolchain install nightly --component rust-src --component clippy
           rustup default nightly
           rustup target add ${{ matrix.target }}
 
