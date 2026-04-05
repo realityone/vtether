@@ -57,12 +57,11 @@ macro_rules! debug_trace {
 }
 
 use conntrack::{
-    ct_create4, ct_lazy_lookup4, CtState, CtStatus, Ipv4CtTuple, CT_EGRESS, CT_INGRESS,
-    CT_SERVICE,
+    CT_EGRESS, CT_INGRESS, CT_SERVICE, CtState, CtStatus, Ipv4CtTuple, ct_create4, ct_lazy_lookup4,
 };
-use lb::{lb4_fill_key, lb4_lookup_backend, lb4_lookup_service, lb4_select_backend_id, Lb4Key};
+use lb::{Lb4Key, lb4_fill_key, lb4_lookup_backend, lb4_lookup_service, lb4_select_backend_id};
 use nat::SnatTarget;
-use parse::{load_tcp_flags, read_field, Ipv4Hdr, IPPROTO_TCP};
+use parse::{IPPROTO_TCP, Ipv4Hdr, load_tcp_flags, read_field};
 
 #[repr(C)]
 pub struct SnatConfig {
@@ -170,7 +169,11 @@ fn handle_forward(
     let backend = match lb4_lookup_backend(backend_id) {
         Some(be) => be,
         None => {
-            debug_error!(ctx, "FWD: backend_id={} not found in LB4_BACKENDS", backend_id);
+            debug_error!(
+                ctx,
+                "FWD: backend_id={} not found in LB4_BACKENDS",
+                backend_id
+            );
             return Err(());
         }
     };
@@ -181,8 +184,16 @@ fn handle_forward(
     let old_sport = orig_tuple.sport;
 
     // DNAT
-    if lb::lb4_xlate_dnat(ctx, ip, l4_off, old_daddr, backend.address, old_dport, backend.port)
-        .is_err()
+    if lb::lb4_xlate_dnat(
+        ctx,
+        ip,
+        l4_off,
+        old_daddr,
+        backend.address,
+        old_dport,
+        backend.port,
+    )
+    .is_err()
     {
         debug_error!(ctx, "FWD: DNAT rewrite failed (bounds check)");
         return Err(());
@@ -287,7 +298,11 @@ fn handle_reply(
             return Ok(pass);
         }
         CtStatus::Established | CtStatus::Reply => {
-            debug_debug!(ctx, "REPLY: CT hit, rev_nat_index={}", ct_state.rev_nat_index);
+            debug_debug!(
+                ctx,
+                "REPLY: CT hit, rev_nat_index={}",
+                ct_state.rev_nat_index
+            );
         }
     }
 
