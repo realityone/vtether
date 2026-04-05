@@ -17,22 +17,25 @@ fn main() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "0.0.0".to_string());
+        .map_or_else(
+            || "0.0.0".to_string(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        );
 
     let commit = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(
+            || "unknown".to_string(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        );
 
     let dirty = Command::new("git")
         .args(["diff", "--quiet", "HEAD"])
         .status()
-        .map(|s| !s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| !s.success());
 
     // Parse version from git describe output
     let tag = describe.strip_prefix('v').unwrap_or(&describe);
@@ -42,13 +45,13 @@ fn main() {
         (tag, false)
     };
     let version = if dev || dirty {
-        format!("{}-dev", version)
+        format!("{version}-dev")
     } else {
         version.to_string()
     };
 
     let commit_display = if dirty {
-        format!("{}-dirty", commit)
+        format!("{commit}-dirty")
     } else {
         commit
     };
@@ -58,15 +61,17 @@ fn main() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(
+            || "unknown".to_string(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        );
 
     // Always rerun build script so git state is fresh
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=.git/refs/tags");
 
-    println!("cargo:rustc-env=VT_VERSION={}", version);
-    println!("cargo:rustc-env=VT_COMMIT={}", commit_display);
-    println!("cargo:rustc-env=VT_BUILD_DATE={}", build_date);
+    println!("cargo:rustc-env=VT_VERSION={version}");
+    println!("cargo:rustc-env=VT_COMMIT={commit_display}");
+    println!("cargo:rustc-env=VT_BUILD_DATE={build_date}");
 }

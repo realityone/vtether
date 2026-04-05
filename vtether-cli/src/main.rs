@@ -91,7 +91,7 @@ struct Config {
 }
 
 fn default_conntrack_size() -> u32 {
-    131072
+    131_072
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Proxy { action } => match action {
             ProxyAction::Up { config, pin_path } => proxy_up(config, pin_path).await,
-            ProxyAction::Destroy { pin_path } => proxy_destroy(pin_path),
+            ProxyAction::Destroy { pin_path } => proxy_destroy(&pin_path),
         },
         Commands::Setup => setup(),
         Commands::Remove => remove(),
@@ -243,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
             print_version();
             Ok(())
         }
-        Commands::Inspect { pin_path, verbose } => inspect(pin_path, verbose),
+        Commands::Inspect { pin_path, verbose } => inspect(&pin_path, verbose),
     }
 }
 
@@ -251,8 +251,7 @@ async fn main() -> anyhow::Result<()> {
 fn state_dir_for(pin_path: &std::path::Path) -> PathBuf {
     let instance = pin_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "default".to_string());
+        .map_or_else(|| "default".to_string(), |n| n.to_string_lossy().into_owned());
     PathBuf::from(STATE_BASE_DIR).join(instance)
 }
 
@@ -271,13 +270,13 @@ fn get_interface_ipv4(interface: &str) -> anyhow::Result<Ipv4Addr> {
         if ifaddr.interface_name != interface {
             continue;
         }
-        if let Some(addr) = ifaddr.address {
-            if let Some(sockaddr) = addr.as_sockaddr_in() {
-                return Ok(Ipv4Addr::from(sockaddr.ip()));
-            }
+        if let Some(addr) = ifaddr.address
+            && let Some(sockaddr) = addr.as_sockaddr_in()
+        {
+            return Ok(sockaddr.ip());
         }
     }
-    anyhow::bail!("no IPv4 address found on interface '{}'", interface)
+    anyhow::bail!("no IPv4 address found on interface '{interface}'")
 }
 
 fn get_default_interface() -> anyhow::Result<String> {
@@ -288,10 +287,10 @@ fn get_default_interface() -> anyhow::Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(idx) = parts.iter().position(|&p| p == "dev") {
-            if let Some(iface) = parts.get(idx + 1) {
-                return Ok(iface.to_string());
-            }
+        if let Some(idx) = parts.iter().position(|&p| p == "dev")
+            && let Some(iface) = parts.get(idx + 1)
+        {
+            return Ok(iface.to_string());
         }
     }
     anyhow::bail!("no default route found")
@@ -310,7 +309,9 @@ fn setup() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("failed to create {}", config_dir.display()))?;
 
-    if !PathBuf::from(DEFAULT_CONFIG_PATH).exists() {
+    if PathBuf::from(DEFAULT_CONFIG_PATH).exists() {
+        println!("  exists  {DEFAULT_CONFIG_PATH} (not overwritten)");
+    } else {
         let config_content = format!(
             "\
 # vtether configuration
@@ -334,10 +335,8 @@ interface: {default_iface}
 "
         );
         std::fs::write(DEFAULT_CONFIG_PATH, &config_content)
-            .with_context(|| format!("failed to write {}", DEFAULT_CONFIG_PATH))?;
-        println!("  created {}", DEFAULT_CONFIG_PATH);
-    } else {
-        println!("  exists  {} (not overwritten)", DEFAULT_CONFIG_PATH);
+            .with_context(|| format!("failed to write {DEFAULT_CONFIG_PATH}"))?;
+        println!("  created {DEFAULT_CONFIG_PATH}");
     }
 
     let unit_content = format!(
@@ -358,8 +357,8 @@ WantedBy=multi-user.target
         config = DEFAULT_CONFIG_PATH,
     );
     std::fs::write(SYSTEMD_UNIT_PATH, &unit_content)
-        .with_context(|| format!("failed to write {}", SYSTEMD_UNIT_PATH))?;
-    println!("  created {}", SYSTEMD_UNIT_PATH);
+        .with_context(|| format!("failed to write {SYSTEMD_UNIT_PATH}"))?;
+    println!("  created {SYSTEMD_UNIT_PATH}");
 
     let status = std::process::Command::new("systemctl")
         .args(["daemon-reload"])
@@ -370,7 +369,7 @@ WantedBy=multi-user.target
     }
 
     println!("\nvtether setup complete.");
-    println!("  1. Edit {}", DEFAULT_CONFIG_PATH);
+    println!("  1. Edit {DEFAULT_CONFIG_PATH}");
     println!("  2. systemctl start vtether");
     println!("  3. systemctl enable vtether  (optional, to start on boot)");
 
@@ -387,8 +386,8 @@ fn remove() -> anyhow::Result<()> {
 
     if PathBuf::from(SYSTEMD_UNIT_PATH).exists() {
         std::fs::remove_file(SYSTEMD_UNIT_PATH)
-            .with_context(|| format!("failed to remove {}", SYSTEMD_UNIT_PATH))?;
-        println!("  removed {}", SYSTEMD_UNIT_PATH);
+            .with_context(|| format!("failed to remove {SYSTEMD_UNIT_PATH}"))?;
+        println!("  removed {SYSTEMD_UNIT_PATH}");
     }
 
     let _ = std::process::Command::new("systemctl")
@@ -399,6 +398,7 @@ fn remove() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {}", config_path.display()))?;
@@ -423,7 +423,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     let snat_ip: Ipv4Addr = match &config.snat_ip {
         Some(ip_str) => ip_str
             .parse()
-            .with_context(|| format!("invalid snat_ip: {}", ip_str))?,
+            .with_context(|| format!("invalid snat_ip: {ip_str}"))?,
         None => get_interface_ipv4(&config.interface)?,
     };
     let snat_ip_be = u32::from(snat_ip).to_be();
@@ -443,7 +443,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     // Check for duplicate ports
     let mut seen = std::collections::HashSet::new();
     for (port, _) in &parsed_routes {
-        anyhow::ensure!(seen.insert(*port), "duplicate route: tcp/{}", port);
+        anyhow::ensure!(seen.insert(*port), "duplicate route: tcp/{port}");
     }
 
     // Load vtether-xdp eBPF with configurable conntrack map size
@@ -564,9 +564,8 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     }
 
     // Init eBPF logger
-    #[allow(clippy::ignored_unit_patterns)]
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        log::warn!("failed to init eBPF logger: {}", e);
+        log::warn!("failed to init eBPF logger: {e}");
     }
 
     // Pin maps
@@ -576,7 +575,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     for &(map_name, pin_name) in MAP_PINS {
         if let Some(map) = ebpf.map(map_name) {
             map.pin(pin_path.join(pin_name))
-                .with_context(|| format!("failed to pin {} map", map_name))?;
+                .with_context(|| format!("failed to pin {map_name} map"))?;
         }
     }
 
@@ -599,7 +598,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         let link = prog.take_link(link_id)?;
         let fd_link: FdLink = link
             .try_into()
-            .map_err(|e| anyhow::anyhow!("failed to convert XDP link to FdLink: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("failed to convert XDP link to FdLink: {e}"))?;
         fd_link
             .pin(pin_path.join("link"))
             .context("failed to pin XDP link to bpffs")?;
@@ -636,8 +635,8 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         config.interface, snat_ip, config.conntrack_size
     );
     for (port, to) in &parsed_routes {
-        println!("  tcp :{} -> {}", port, to);
-        info!("route: tcp :{} -> {}", port, to);
+        println!("  tcp :{port} -> {to}");
+        info!("route: tcp :{port} -> {to}");
     }
 
     // Spawn conntrack GC task
@@ -645,8 +644,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
     let reaper_handle = tokio::spawn(async move {
         let mut gc_interval_secs = GC_INTERVAL_DEFAULT_SECS;
         info!(
-            "conntrack gc started (initial interval: {}s, bounds: {}s-{}s)",
-            gc_interval_secs, GC_INTERVAL_MIN_SECS, GC_INTERVAL_MAX_SECS,
+            "conntrack gc started (initial interval: {gc_interval_secs}s, bounds: {GC_INTERVAL_MIN_SECS}s-{GC_INTERVAL_MAX_SECS}s)",
         );
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(gc_interval_secs)).await;
@@ -665,7 +663,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
                         adapt_gc_interval(gc_interval_secs, result.total, result.expired);
                 }
                 Err(e) => {
-                    log::warn!("conntrack gc error: {:#}", e);
+                    log::warn!("conntrack gc error: {e:#}");
                 }
             }
         }
@@ -676,7 +674,7 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
         }
-        _ = async {
+        () = async {
             let mut sigterm = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::terminate()
             ).expect("failed to register SIGTERM handler");
@@ -702,8 +700,8 @@ async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()>
 //   <5% deleted:  interval = interval * 1.5           (grow slowly)
 //   5-25%:        keep unchanged
 
-/// Read kernel monotonic clock (matches bpf_ktime_get_ns in the datapath).
-/// Cilium uses CLOCK_MONOTONIC; bpf_ktime_get_ns() is also CLOCK_MONOTONIC.
+/// Read kernel monotonic clock (matches `bpf_ktime_get_ns` in the datapath).
+/// Cilium uses `CLOCK_MONOTONIC`; `bpf_ktime_get_ns()` is also `CLOCK_MONOTONIC`.
 fn ktime_get_ns() -> u64 {
     // Note: nix doesn't expose CLOCK_MONOTONIC_RAW directly, but
     // CLOCK_MONOTONIC matches bpf_ktime_get_ns() on Linux.
@@ -723,8 +721,9 @@ struct GcResult {
 ///
 /// Cilium (gc.go:579-600):
 ///   >25%: `prevInterval * (1.0 - deleteRatio)` (proportional)
-///   <5%:  `prevInterval * 1.5`
-///   else: unchanged
+/// > <5%:  `prevInterval * 1.5`
+/// > else: unchanged
+#[allow(clippy::cast_precision_loss)]
 fn adapt_gc_interval(current_secs: u64, total: u64, expired: u64) -> u64 {
     if total == 0 {
         return current_secs;
@@ -768,12 +767,10 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     // Cilium (ctmap.go:551): `if entry.Lifetime < filter.Time { deleteEntry }`
     let mut expired_keys: Vec<Ipv4CtTuple> = Vec::new();
     let mut total: u64 = 0;
-    for item in ct4.iter() {
-        if let Ok((key, val)) = item {
-            total += 1;
-            if val.lifetime < now {
-                expired_keys.push(key);
-            }
+    for (key, val) in ct4.iter().flatten() {
+        total += 1;
+        if val.lifetime < now {
+            expired_keys.push(key);
         }
     }
 
@@ -801,49 +798,44 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
             HashMap::try_from(snat_map).context("failed to parse SNAT4 map")?;
 
         let mut orphan_keys: Vec<Ipv4CtTuple> = Vec::new();
-        for item in snat4.iter() {
-            if let Ok((snat_key, snat_val)) = item {
-                // Construct the CT key that should exist if this SNAT entry is alive.
-                //
-                // With single-entry CT model, each connection has one CT entry keyed by
-                // the service tuple: {daddr=VIP, saddr=client, dport=svc_port, sport=client_port}.
-                // The SNAT entry stores svc_addr/svc_port for CT key reconstruction.
-                //
-                // For TUPLE_F_IN (reverse SNAT entry):
-                //   SNAT val contains {to_addr=client_ip, to_port=client_port, svc_addr, svc_port}
-                //   CT key = {daddr=svc_addr, saddr=client_ip, dport=svc_port, sport=client_port}
-                //
-                // For TUPLE_F_OUT (forward SNAT entry):
-                //   Check if the reverse SNAT peer still exists.
-                let exists = match snat_key.flags {
-                    TUPLE_F_IN => {
-                        let ct_key = Ipv4CtTuple {
-                            daddr: snat_val.svc_addr, // VIP
-                            saddr: snat_val.to_addr,  // client_ip
-                            dport: snat_val.svc_port, // svc_port
-                            sport: snat_val.to_port,  // client_port
-                            nexthdr: IPPROTO_TCP,
-                            flags: TUPLE_F_SERVICE,
-                        };
-                        ct4.get(&ct_key, 0).is_ok()
-                    }
-                    _ => {
-                        // Forward SNAT -> check if reverse SNAT peer exists
-                        let rev_key = Ipv4CtTuple {
-                            saddr: snat_val.to_addr, // snat_ip
-                            daddr: snat_key.daddr,   // backend_ip
-                            sport: snat_val.to_port, // snat_port
-                            dport: snat_key.dport,   // backend_port
-                            nexthdr: IPPROTO_TCP,
-                            flags: TUPLE_F_IN,
-                        };
-                        snat4.get(&rev_key, 0).is_ok()
-                    }
+        for (snat_key, snat_val) in snat4.iter().flatten() {
+            // Construct the CT key that should exist if this SNAT entry is alive.
+            //
+            // With single-entry CT model, each connection has one CT entry keyed by
+            // the service tuple: {daddr=VIP, saddr=client, dport=svc_port, sport=client_port}.
+            // The SNAT entry stores svc_addr/svc_port for CT key reconstruction.
+            //
+            // For TUPLE_F_IN (reverse SNAT entry):
+            //   SNAT val contains {to_addr=client_ip, to_port=client_port, svc_addr, svc_port}
+            //   CT key = {daddr=svc_addr, saddr=client_ip, dport=svc_port, sport=client_port}
+            //
+            // For TUPLE_F_OUT (forward SNAT entry):
+            //   Check if the reverse SNAT peer still exists.
+            let exists = if snat_key.flags == TUPLE_F_IN {
+                let ct_key = Ipv4CtTuple {
+                    daddr: snat_val.svc_addr, // VIP
+                    saddr: snat_val.to_addr,  // client_ip
+                    dport: snat_val.svc_port, // svc_port
+                    sport: snat_val.to_port,  // client_port
+                    nexthdr: IPPROTO_TCP,
+                    flags: TUPLE_F_SERVICE,
                 };
+                ct4.get(&ct_key, 0).is_ok()
+            } else {
+                // Forward SNAT -> check if reverse SNAT peer exists
+                let rev_key = Ipv4CtTuple {
+                    saddr: snat_val.to_addr, // snat_ip
+                    daddr: snat_key.daddr,   // backend_ip
+                    sport: snat_val.to_port, // snat_port
+                    dport: snat_key.dport,   // backend_port
+                    nexthdr: IPPROTO_TCP,
+                    flags: TUPLE_F_IN,
+                };
+                snat4.get(&rev_key, 0).is_ok()
+            };
 
-                if !exists {
-                    orphan_keys.push(snat_key);
-                }
+            if !exists {
+                orphan_keys.push(snat_key);
             }
         }
 
@@ -865,7 +857,7 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
 
 // ---- Other commands ----
 
-fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
+fn proxy_destroy(pin_path: &std::path::Path) -> anyhow::Result<()> {
     let prog_pin = pin_path.join("prog");
     anyhow::ensure!(
         prog_pin.exists(),
@@ -873,7 +865,7 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
         prog_pin.display()
     );
 
-    let state_dir = state_dir_for(&pin_path);
+    let state_dir = state_dir_for(pin_path);
     let interface = std::fs::read_to_string(state_dir.join("interface"))
         .context("failed to read interface; was proxy started with `proxy up`?")?;
 
@@ -893,7 +885,7 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
     for &(_, pin_name) in MAP_PINS {
         let _ = std::fs::remove_file(pin_path.join(pin_name));
     }
-    let _ = std::fs::remove_dir(&pin_path);
+    let _ = std::fs::remove_dir(pin_path);
     let _ = std::fs::remove_dir_all(&state_dir);
 
     println!(
@@ -904,7 +896,8 @@ fn proxy_destroy(pin_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
+#[allow(clippy::too_many_lines)]
+fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {
     let prog_pin = pin_path.join("prog");
     anyhow::ensure!(
         prog_pin.exists(),
@@ -912,7 +905,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
         prog_pin.display()
     );
 
-    let state_dir = state_dir_for(&pin_path);
+    let state_dir = state_dir_for(pin_path);
     let interface = std::fs::read_to_string(state_dir.join("interface"))
         .unwrap_or_else(|_| "unknown".to_string());
     println!("vtether: attached to {}", interface.trim());
@@ -944,7 +937,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
         println!("\nRoutes:");
         // Iterate service entries (slot 0 only)
         for item in svc_map.iter() {
-            let (key, svc) = item.map_err(|e| anyhow::anyhow!("map iteration error: {}", e))?;
+            let (key, svc) = item.map_err(|e| anyhow::anyhow!("map iteration error: {e}"))?;
             if key.backend_slot != 0 {
                 continue;
             }
@@ -964,15 +957,14 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
                     _pad: [0; 2],
                 },
                 0,
-            ) {
-                if let Ok(backend) = be_map.get(&slot1_svc.backend_id, 0) {
-                    let dst_ip = Ipv4Addr::from(u32::from_be(backend.address));
-                    let dst_port = u16::from_be(backend.port);
-                    println!(
-                        "  tcp :{} -> {}:{} (snat: {})",
-                        listen_port, dst_ip, dst_port, snat_ip,
-                    );
-                }
+            )
+                && let Ok(backend) = be_map.get(&slot1_svc.backend_id, 0)
+            {
+                let dst_ip = Ipv4Addr::from(u32::from_be(backend.address));
+                let dst_port = u16::from_be(backend.port);
+                println!(
+                    "  tcp :{listen_port} -> {dst_ip}:{dst_port} (snat: {snat_ip})",
+                );
             }
 
             // Stats
@@ -983,7 +975,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
             if let Some(s) = route_stats
                 .as_ref()
                 .and_then(|m| m.get(&stats_key, 0).ok())
-                .map(aggregate_stats)
+                .map(|v| aggregate_stats(&v))
             {
                 print!(
                     "    connections: {}  packets: {}  bytes: {}",
@@ -1007,7 +999,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
             let map = Map::LruHashMap(map_data);
             let ct4: HashMap<_, Ipv4CtTuple, CtEntry> =
                 HashMap::try_from(map).context("failed to parse CT4 map")?;
-            Ok(ct4.iter().filter_map(|i| i.ok()).collect())
+            Ok(ct4.iter().filter_map(Result::ok).collect())
         })() {
             Ok(entries) => {
                 println!("\nActive connections: {} CT entries", entries.len());
@@ -1019,7 +1011,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
                     }
                 }
             }
-            Err(e) => println!("\nActive connections: unknown ({:#})", e),
+            Err(e) => println!("\nActive connections: unknown ({e:#})"),
         }
     }
 
@@ -1033,7 +1025,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
                 let map = Map::LruHashMap(map_data);
                 let snat4: HashMap<_, Ipv4CtTuple, SnatEntry> =
                     HashMap::try_from(map).context("failed to parse SNAT4 map")?;
-                Ok(snat4.iter().filter_map(|i| i.ok()).collect())
+                Ok(snat4.iter().filter_map(Result::ok).collect())
             })() {
                 Ok(entries) => {
                     println!("\nSNAT4 entries ({}):", entries.len());
@@ -1041,7 +1033,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
                         print_snat_entry(tuple, entry);
                     }
                 }
-                Err(e) => println!("\nSNAT4: unknown ({:#})", e),
+                Err(e) => println!("\nSNAT4: unknown ({e:#})"),
             }
         }
     }
@@ -1101,10 +1093,11 @@ fn format_duration_human(secs: f64) -> String {
     } else if abs >= 60.0 {
         format!("{:.0}m", secs / 60.0)
     } else {
-        format!("{:.0}s", secs)
+        format!("{secs:.0}s")
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn print_ct_entry(tuple: &Ipv4CtTuple, entry: &CtEntry, now_ns: u64) {
     let saddr = Ipv4Addr::from(u32::from_be(tuple.saddr));
     let daddr = Ipv4Addr::from(u32::from_be(tuple.daddr));
@@ -1160,12 +1153,11 @@ fn print_snat_entry(tuple: &Ipv4CtTuple, entry: &SnatEntry) {
     let svc_port = u16::from_be(entry.svc_port);
 
     println!(
-        "  {}:{} -> {}:{}  dir={}  => {}:{}  svc={}:{}",
-        saddr, sport, daddr, dport, dir, to_addr, to_port, svc_addr, svc_port,
+        "  {saddr}:{sport} -> {daddr}:{dport}  dir={dir}  => {to_addr}:{to_port}  svc={svc_addr}:{svc_port}",
     );
 }
 
-fn aggregate_stats(per_cpu: PerCpuValues<RouteStats>) -> RouteStats {
+fn aggregate_stats(per_cpu: &PerCpuValues<RouteStats>) -> RouteStats {
     let mut total = RouteStats {
         connections: 0,
         packets: 0,
@@ -1181,6 +1173,7 @@ fn aggregate_stats(per_cpu: PerCpuValues<RouteStats>) -> RouteStats {
     total
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -1191,7 +1184,7 @@ fn format_bytes(bytes: u64) -> String {
         GIB.. => format!("{:.2} GiB", bytes as f64 / GIB as f64),
         MIB.. => format!("{:.2} MiB", bytes as f64 / MIB as f64),
         KIB.. => format!("{:.2} KiB", bytes as f64 / KIB as f64),
-        _ => format!("{} B", bytes),
+        _ => format!("{bytes} B"),
     }
 }
 
@@ -1201,13 +1194,13 @@ fn setup_sysctl(interface: &str) -> anyhow::Result<()> {
     let sysctls = [
         "net.ipv4.ip_forward=1".to_string(),
         "net.ipv4.conf.all.accept_local=1".to_string(),
-        format!("net.ipv4.conf.{}.accept_local=1", interface),
+        format!("net.ipv4.conf.{interface}.accept_local=1"),
     ];
     for s in &sysctls {
         let output = std::process::Command::new("sysctl")
             .args(["-w", s])
             .output()
-            .with_context(|| format!("failed to run sysctl -w {}", s))?;
+            .with_context(|| format!("failed to run sysctl -w {s}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("sysctl -w {} failed: {}", s, stderr.trim());

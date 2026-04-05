@@ -215,7 +215,7 @@ fn handle_forward(
         min_port: snat_cfg.min_port,
         max_port: snat_cfg.max_port,
     };
-    let snat_port = match nat::snat_v4_nat(
+    let _snat_port = match nat::snat_v4_nat(
         ctx,
         ip,
         l4_off,
