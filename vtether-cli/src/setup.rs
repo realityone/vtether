@@ -5,6 +5,43 @@ use anyhow::Context as _;
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/vtether/config.yaml";
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
 
+/// Template for the default config file. `{default_iface}` is replaced at runtime.
+pub const CONFIG_TEMPLATE: &str = "\
+# vtether configuration
+# See: https://github.com/realityone/vtether
+
+# Network interface to attach XDP program to
+interface: {default_iface}
+
+# Source IP for SNAT (optional, auto-detected from interface)
+# snat_ip: \"192.168.1.100\"
+
+# Max conntrack entries (default: 131072)
+# conntrack_size: 131072
+
+# TCP forwarding routes
+# routes:
+#   - port: 443
+#     to: \"10.0.0.1:443\"
+#   - port: 8080
+#     to: \"10.0.0.2:80\"
+";
+
+/// Template for the systemd unit file. `{bin}` and `{config}` are replaced at runtime.
+pub const SYSTEMD_UNIT_TEMPLATE: &str = "\
+[Unit]
+Description=vtether - eBPF/XDP port forwarder
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={bin} proxy up --config {config}
+ExecStop={bin} proxy destroy
+
+[Install]
+WantedBy=multi-user.target
+";
+
 fn get_default_interface() -> anyhow::Result<String> {
     let output = std::process::Command::new("ip")
         .args(["-4", "route", "show", "default"])
@@ -38,50 +75,15 @@ pub fn setup() -> anyhow::Result<()> {
     if PathBuf::from(DEFAULT_CONFIG_PATH).exists() {
         println!("  exists  {DEFAULT_CONFIG_PATH} (not overwritten)");
     } else {
-        let config_content = format!(
-            "\
-# vtether configuration
-# See: https://github.com/realityone/vtether
-
-# Network interface to attach XDP program to
-interface: {default_iface}
-
-# Source IP for SNAT (optional, auto-detected from interface)
-# snat_ip: \"192.168.1.100\"
-
-# Max conntrack entries (default: 131072)
-# conntrack_size: 131072
-
-# TCP forwarding routes
-# routes:
-#   - port: 443
-#     to: \"10.0.0.1:443\"
-#   - port: 8080
-#     to: \"10.0.0.2:80\"
-"
-        );
+        let config_content = CONFIG_TEMPLATE.replace("{default_iface}", &default_iface);
         std::fs::write(DEFAULT_CONFIG_PATH, &config_content)
             .with_context(|| format!("failed to write {DEFAULT_CONFIG_PATH}"))?;
         println!("  created {DEFAULT_CONFIG_PATH}");
     }
 
-    let unit_content = format!(
-        "\
-[Unit]
-Description=vtether - eBPF/XDP port forwarder
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={bin} proxy up --config {config}
-ExecStop={bin} proxy destroy
-
-[Install]
-WantedBy=multi-user.target
-",
-        bin = vtether_bin.display(),
-        config = DEFAULT_CONFIG_PATH,
-    );
+    let unit_content = SYSTEMD_UNIT_TEMPLATE
+        .replace("{bin}", &vtether_bin.display().to_string())
+        .replace("{config}", DEFAULT_CONFIG_PATH);
     std::fs::write(SYSTEMD_UNIT_PATH, &unit_content)
         .with_context(|| format!("failed to write {SYSTEMD_UNIT_PATH}"))?;
     println!("  created {SYSTEMD_UNIT_PATH}");
