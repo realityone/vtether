@@ -190,7 +190,8 @@ struct SnatEntry {
     created: u64,
     to_addr: u32,
     to_port: u16,
-    _pad: u16,
+    svc_addr: u32,
+    svc_port: u16,
 }
 unsafe impl aya::Pod for SnatEntry {}
 
@@ -743,6 +744,7 @@ fn adapt_gc_interval(current_secs: u64, total: u64, expired: u64) -> u64 {
 
 /// SNAT tuple direction flags (must match vtether-xdp nat.rs).
 const TUPLE_F_IN: u8 = 1;
+const TUPLE_F_SERVICE: u8 = 4;
 
 fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
     let ct4_path = pin_path.join("ct4");
@@ -803,54 +805,40 @@ fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
             if let Ok((snat_key, snat_val)) = item {
                 // Construct the CT key that should exist if this SNAT entry is alive.
                 //
-                // For TUPLE_F_OUT (forward SNAT entry):
-                //   SNAT key = {saddr=client, daddr=backend, sport=client_port, dport=backend_port}
-                //   SNAT val = {to_addr=snat_ip, to_port=snat_port}
-                //   Corresponding CT key = forward CT entry (CT_EGRESS|CT_SERVICE):
-                //     {daddr=VIP, saddr=client, dport=svc_port, sport=client_port}
-                //   We can't reconstruct VIP/svc_port from SNAT alone, so instead check
-                //   if the reverse SNAT entry's corresponding CT exists.
+                // With single-entry CT model, each connection has one CT entry keyed by
+                // the service tuple: {daddr=VIP, saddr=client, dport=svc_port, sport=client_port}.
+                // The SNAT entry stores svc_addr/svc_port for CT key reconstruction.
                 //
                 // For TUPLE_F_IN (reverse SNAT entry):
-                //   SNAT key = {saddr=snat_ip, daddr=backend, sport=snat_port, dport=backend_port}
-                //   SNAT val = {to_addr=client_ip, to_port=client_port}
-                //   Corresponding CT key = reverse CT entry (CT_EGRESS, used by reply path):
-                //     {daddr=client_ip, saddr=backend_ip, dport=client_port, sport=backend_port}
+                //   SNAT val contains {to_addr=client_ip, to_port=client_port, svc_addr, svc_port}
+                //   CT key = {daddr=svc_addr, saddr=client_ip, dport=svc_port, sport=client_port}
                 //
-                // Cilium checks if the egress CT entry exists for the connection.
-                // We check the reverse CT entry since it's directly derivable.
-                let ct_key = match snat_key.flags {
+                // For TUPLE_F_OUT (forward SNAT entry):
+                //   Check if the reverse SNAT peer still exists.
+                let exists = match snat_key.flags {
                     TUPLE_F_IN => {
-                        // Reverse SNAT -> check if reverse CT entry exists
-                        Ipv4CtTuple {
-                            daddr: snat_val.to_addr, // client_ip
-                            saddr: snat_key.daddr,   // backend_ip
-                            dport: snat_val.to_port, // client_port
-                            sport: snat_key.dport,   // backend_port
+                        let ct_key = Ipv4CtTuple {
+                            daddr: snat_val.svc_addr, // VIP
+                            saddr: snat_val.to_addr,  // client_ip
+                            dport: snat_val.svc_port, // svc_port
+                            sport: snat_val.to_port,  // client_port
                             nexthdr: IPPROTO_TCP,
-                            flags: 0, // CT_EGRESS (the reverse CT entry created on forward path)
-                        }
+                            flags: TUPLE_F_SERVICE,
+                        };
+                        ct4.get(&ct_key, 0).is_ok()
                     }
                     _ => {
-                        // Forward SNAT -> check if forward SNAT's reverse counterpart exists
-                        // If the reverse SNAT entry is gone, this forward entry is orphaned too.
-                        // Use the reverse SNAT key to check.
-                        Ipv4CtTuple {
+                        // Forward SNAT -> check if reverse SNAT peer exists
+                        let rev_key = Ipv4CtTuple {
                             saddr: snat_val.to_addr, // snat_ip
                             daddr: snat_key.daddr,   // backend_ip
                             sport: snat_val.to_port, // snat_port
                             dport: snat_key.dport,   // backend_port
                             nexthdr: IPPROTO_TCP,
                             flags: TUPLE_F_IN,
-                        }
+                        };
+                        snat4.get(&rev_key, 0).is_ok()
                     }
-                };
-
-                // Check existence: for TUPLE_F_IN entries, look up CT4.
-                // For TUPLE_F_OUT entries, look up SNAT4 (check if reverse peer exists).
-                let exists = match snat_key.flags {
-                    TUPLE_F_IN => ct4.get(&ct_key, 0).is_ok(),
-                    _ => snat4.get(&ct_key, 0).is_ok(),
                 };
 
                 if !exists {
@@ -1022,7 +1010,7 @@ fn inspect(pin_path: PathBuf, verbose: bool) -> anyhow::Result<()> {
             Ok(ct4.iter().filter_map(|i| i.ok()).collect())
         })() {
             Ok(entries) => {
-                println!("\nActive connections: {} (CT entries / 2)", entries.len());
+                println!("\nActive connections: {} CT entries", entries.len());
                 if verbose {
                     let now = ktime_get_ns();
                     println!("\nCT4 entries ({}):", entries.len());
@@ -1085,7 +1073,7 @@ fn ct_dir_str(flags: u8) -> &'static str {
     match flags {
         0 => "EGRESS",
         1 => "INGRESS",
-        4 => "EGRESS|SERVICE",
+        4 => "SERVICE",
         5 => "INGRESS|SERVICE",
         _ => "UNKNOWN",
     }
@@ -1164,10 +1152,12 @@ fn print_snat_entry(tuple: &Ipv4CtTuple, entry: &SnatEntry) {
 
     let to_addr = Ipv4Addr::from(u32::from_be(entry.to_addr));
     let to_port = u16::from_be(entry.to_port);
+    let svc_addr = Ipv4Addr::from(u32::from_be(entry.svc_addr));
+    let svc_port = u16::from_be(entry.svc_port);
 
     println!(
-        "  {}:{} -> {}:{}  dir={}  => {}:{}",
-        saddr, sport, daddr, dport, dir, to_addr, to_port,
+        "  {}:{} -> {}:{}  dir={}  => {}:{}  svc={}:{}",
+        saddr, sport, daddr, dport, dir, to_addr, to_port, svc_addr, svc_port,
     );
 }
 

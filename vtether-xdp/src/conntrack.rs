@@ -4,8 +4,9 @@
 ///
 /// # Design
 ///
-/// Uses a single HashMap keyed by `Ipv4CtTuple`. Each connection has two entries:
-/// forward (CT_EGRESS|CT_SERVICE) and reverse (CT_INGRESS), distinguished by `flags`.
+/// Uses a single LruHashMap keyed by `Ipv4CtTuple`. Each connection has ONE entry
+/// (keyed with `TUPLE_F_SERVICE`). Both forward and reply paths look up the same
+/// entry; the `update_dir` parameter controls which flags (tx/rx) are updated.
 ///
 /// # TCP State Machine
 ///
@@ -19,14 +20,19 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::LruHashMap;
 
-// ---- CT direction flags (stored in Ipv4CtTuple.flags) ----
+// ---- CT direction constants (passed to functions, NOT stored in tuple.flags) ----
 
 /// Forward/egress direction: client -> service -> backend.
 pub const CT_EGRESS: u8 = 0;
 /// Reverse/reply direction: backend -> client.
 pub const CT_INGRESS: u8 = 1;
-/// Service connection (used in combination with CT_EGRESS).
+/// Service connection direction (for tuple flag selection and close behavior).
 pub const CT_SERVICE: u8 = 4;
+
+// ---- Tuple flag constants (stored in Ipv4CtTuple.flags) ----
+
+/// Service tuple flag value — the only flag used for service CT entries.
+pub const TUPLE_F_SERVICE: u8 = 4;
 
 // ---- TCP flags ----
 
@@ -43,7 +49,7 @@ pub enum CtStatus {
     New,
     /// Existing forward entry found.
     Established,
-    /// Existing reverse (reply) entry found.
+    /// Existing reply entry found (same entry, looked up on reply path).
     #[allow(dead_code)]
     Reply,
 }
@@ -179,11 +185,11 @@ fn ct_select_timeout(entry: *mut CtEntry, tcp_flags: u8) -> u64 {
 }
 
 #[inline(always)]
-fn ct_update_timeout(entry: *mut CtEntry, lifetime_ns: u64, dir: u8, tcp_flags: u8) {
+fn ct_update_timeout(entry: *mut CtEntry, lifetime_ns: u64, update_dir: u8, tcp_flags: u8) {
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
     unsafe { (*entry).lifetime = now + lifetime_ns };
 
-    match dir {
+    match update_dir {
         CT_INGRESS => unsafe { (*entry).rx_flags_seen |= tcp_flags },
         _ => unsafe { (*entry).tx_flags_seen |= tcp_flags },
     }
@@ -204,6 +210,7 @@ fn ct_lookup_inner(
     tuple: &Ipv4CtTuple,
     action: CtAction,
     dir: u8,
+    update_dir: u8,
     tcp_flags: u8,
     ct_state: &mut CtState,
 ) -> CtStatus {
@@ -218,7 +225,7 @@ fn ct_lookup_inner(
 
     if ct_entry_alive(entry) {
         let lifetime = ct_select_timeout(entry_ptr, tcp_flags);
-        ct_update_timeout(entry_ptr, lifetime, dir, tcp_flags);
+        ct_update_timeout(entry_ptr, lifetime, update_dir, tcp_flags);
     }
 
     match action {
@@ -229,7 +236,7 @@ fn ct_lookup_inner(
                 unsafe { (*entry_ptr).seen_non_syn = 0 };
 
                 let lifetime = ct_select_timeout(entry_ptr, tcp_flags);
-                ct_update_timeout(entry_ptr, lifetime, dir, tcp_flags);
+                ct_update_timeout(entry_ptr, lifetime, update_dir, tcp_flags);
 
                 return CtStatus::New;
             }
@@ -248,7 +255,7 @@ fn ct_lookup_inner(
             ct_state.closing = true;
 
             if !ct_entry_alive(unsafe { &*entry_ptr }) {
-                ct_update_timeout(entry_ptr, CT_CLOSE_TIMEOUT_NS, dir, tcp_flags);
+                ct_update_timeout(entry_ptr, CT_CLOSE_TIMEOUT_NS, update_dir, tcp_flags);
             }
         }
         CtAction::Unspec => {}
@@ -260,21 +267,35 @@ fn ct_lookup_inner(
 
 // ---- Public CT API ----
 
-/// Lookup a CT entry. Loads TCP flags from the packet at `l4_off`.
+/// Lookup a CT entry for a service connection.
+///
+/// - `dir`: determines close behavior (CT_SERVICE closes both directions)
+/// - `update_dir`: determines which flags are updated (CT_EGRESS -> tx, CT_INGRESS -> rx)
+///
+/// Forward path: `ct_lazy_lookup4(flags, tuple, CT_SERVICE, CT_EGRESS, state)`
+/// Reply path:   `ct_lazy_lookup4(flags, tuple, CT_SERVICE, CT_INGRESS, state)`
 #[inline(always)]
 pub fn ct_lazy_lookup4(
     tcp_flags: u8,
     tuple: &Ipv4CtTuple,
     dir: u8,
+    update_dir: u8,
     ct_state: &mut CtState,
 ) -> CtStatus {
     let action = ct_tcp_select_action(tcp_flags);
-    ct_lookup_inner(tuple, action, dir, tcp_flags, ct_state)
+    ct_lookup_inner(tuple, action, dir, update_dir, tcp_flags, ct_state)
 }
 
 /// Create a new CT entry.
+///
+/// `update_dir` controls initial flag setup: CT_EGRESS sets tx_flags=SYN,
+/// CT_INGRESS sets rx_flags=SYN.
 #[inline(always)]
-pub fn ct_create4(tuple: &Ipv4CtTuple, ct_state: &CtState) -> Result<(), ()> {
+pub fn ct_create4(
+    tuple: &Ipv4CtTuple,
+    ct_state: &CtState,
+    update_dir: u8,
+) -> Result<(), ()> {
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
     let entry = CtEntry {
@@ -282,13 +303,13 @@ pub fn ct_create4(tuple: &Ipv4CtTuple, ct_state: &CtState) -> Result<(), ()> {
         rev_nat_index: ct_state.rev_nat_index,
         closing: 0,
         seen_non_syn: 0,
-        tx_flags_seen: match tuple.flags & CT_INGRESS {
-            0 => TCP_SYN,
-            _ => 0,
-        },
-        rx_flags_seen: match tuple.flags & CT_INGRESS {
-            0 => 0,
+        tx_flags_seen: match update_dir {
+            CT_INGRESS => 0,
             _ => TCP_SYN,
+        },
+        rx_flags_seen: match update_dir {
+            CT_INGRESS => TCP_SYN,
+            _ => 0,
         },
         _pad: [0; 2],
         lifetime: now + CT_SYN_TIMEOUT_NS,

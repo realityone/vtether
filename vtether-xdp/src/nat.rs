@@ -28,12 +28,16 @@ const TUPLE_F_IN: u8 = 1;
 pub type SnatKey = Ipv4CtTuple;
 
 /// SNAT mapping entry -- the map value.
+///
+/// Stores the translated address/port, plus the service VIP/port needed
+/// for CT key reconstruction on the reply path.
 #[repr(C)]
 pub struct SnatEntry {
     pub created: u64,
     pub to_addr: u32,
     pub to_port: u16,
-    pub _pad: u16,
+    pub svc_addr: u32,
+    pub svc_port: u16,
 }
 
 /// SNAT target configuration.
@@ -117,6 +121,8 @@ fn snat_v4_new_mapping(
     backend_ip: u32,
     client_port: u16,
     backend_port: u16,
+    svc_addr: u32,
+    svc_port: u16,
     target: &SnatTarget,
 ) -> Result<u16, ()> {
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
@@ -125,7 +131,8 @@ fn snat_v4_new_mapping(
         created: now,
         to_addr: client_ip,
         to_port: client_port,
-        _pad: 0,
+        svc_addr,
+        svc_port,
     };
 
     let orig_port_host = u16::from_be(client_port);
@@ -145,7 +152,8 @@ fn snat_v4_new_mapping(
                 created: now,
                 to_addr: target.addr,
                 to_port: snat_port_be,
-                _pad: 0,
+                svc_addr,
+                svc_port,
             };
 
             if SNAT4.insert(&fwd_key, &fwd_state, 0).is_err() {
@@ -182,6 +190,8 @@ pub fn snat_v4_nat(
     client_port: u16,
     backend_ip: u32,
     backend_port: u16,
+    svc_addr: u32,
+    svc_port: u16,
     target: &SnatTarget,
 ) -> Result<u16, ()> {
     let fwd_key = snat_v4_make_fwd_key(client_ip, backend_ip, client_port, backend_port);
@@ -189,7 +199,15 @@ pub fn snat_v4_nat(
     let snat_port = if let Some(existing) = unsafe { SNAT4.get(&fwd_key) } {
         existing.to_port
     } else {
-        snat_v4_new_mapping(client_ip, backend_ip, client_port, backend_port, target)?
+        snat_v4_new_mapping(
+            client_ip,
+            backend_ip,
+            client_port,
+            backend_port,
+            svc_addr,
+            svc_port,
+            target,
+        )?
     };
 
     snat_v4_rewrite_egress(
@@ -238,13 +256,13 @@ fn snat_v4_rewrite_egress(
 
 /// Perform reverse SNAT on the reply path: restore original client IP + port.
 ///
-/// Returns the restored (client_ip, client_port) or Err if no mapping found.
+/// Returns `(client_ip, client_port, svc_addr, svc_port)` or Err if no mapping found.
 #[inline(always)]
 pub fn snat_v4_rev_nat(
     ctx: &XdpContext,
     ip: *mut Ipv4Hdr,
     l4_off: usize,
-) -> Result<(u32, u16), ()> {
+) -> Result<(u32, u16, u32, u16), ()> {
     let snat_ip = read_field(unsafe { addr_of!((*ip).daddr) });
     let backend_ip = read_field(unsafe { addr_of!((*ip).saddr) });
     let snat_port = read_field(ptr_at::<u16>(ctx, l4_off + TCP_DPORT_OFF)? as *const u16);
@@ -256,6 +274,8 @@ pub fn snat_v4_rev_nat(
 
     let client_ip = state.to_addr;
     let client_port = state.to_port;
+    let svc_addr = state.svc_addr;
+    let svc_port = state.svc_port;
 
     let old_daddr = snat_ip;
     let new_daddr = client_ip;
@@ -263,7 +283,7 @@ pub fn snat_v4_rev_nat(
     let new_dport = client_port;
 
     if old_daddr == new_daddr && old_dport == new_dport {
-        return Ok((client_ip, client_port));
+        return Ok((client_ip, client_port, svc_addr, svc_port));
     }
 
     write_field(unsafe { addr_of_mut!((*ip).daddr) }, new_daddr);
@@ -279,5 +299,5 @@ pub fn snat_v4_rev_nat(
         csum_replace2(tcp_ck, old_dport, new_dport);
     }
 
-    Ok((client_ip, client_port))
+    Ok((client_ip, client_port, svc_addr, svc_port))
 }

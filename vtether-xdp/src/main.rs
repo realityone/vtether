@@ -57,7 +57,8 @@ macro_rules! debug_trace {
 }
 
 use conntrack::{
-    CT_EGRESS, CT_INGRESS, CT_SERVICE, CtState, CtStatus, Ipv4CtTuple, ct_create4, ct_lazy_lookup4,
+    CT_EGRESS, CT_INGRESS, CT_SERVICE, CtState, CtStatus, Ipv4CtTuple, TUPLE_F_SERVICE,
+    ct_create4, ct_lazy_lookup4,
 };
 use lb::{Lb4Key, lb4_fill_key, lb4_lookup_backend, lb4_lookup_service, lb4_select_backend_id};
 use nat::SnatTarget;
@@ -120,20 +121,21 @@ fn handle_forward(
 ) -> Result<u32, ()> {
     let drop = aya_ebpf::bindings::xdp_action::XDP_DROP;
 
-    let fwd_tuple = Ipv4CtTuple {
+    // Single CT entry keyed by service tuple (VIP:svc_port <- client:client_port)
+    let svc_tuple = Ipv4CtTuple {
         daddr: orig_tuple.daddr,
         saddr: orig_tuple.saddr,
         dport: orig_tuple.dport,
         sport: orig_tuple.sport,
         nexthdr: IPPROTO_TCP,
-        flags: CT_EGRESS | CT_SERVICE,
+        flags: TUPLE_F_SERVICE,
     };
 
     let mut ct_state = CtState::new();
     ct_state.rev_nat_index = svc.rev_nat_index;
 
     let (backend_id, is_new) =
-        match ct_lazy_lookup4(tcp_flags, &fwd_tuple, CT_SERVICE, &mut ct_state) {
+        match ct_lazy_lookup4(tcp_flags, &svc_tuple, CT_SERVICE, CT_EGRESS, &mut ct_state) {
             CtStatus::New => {
                 if svc.count == 0 {
                     debug_warn!(ctx, "FWD: no backends for service");
@@ -147,7 +149,7 @@ fn handle_forward(
                     return Ok(drop);
                 }
                 ct_state.backend_id = backend_id;
-                if ct_create4(&fwd_tuple, &ct_state).is_err() {
+                if ct_create4(&svc_tuple, &ct_state, CT_EGRESS).is_err() {
                     debug_warn!(ctx, "FWD: ct_create4 failed (CT map full?)");
                     stats::update_route_drops(svc.rev_nat_index);
                     return Ok(drop);
@@ -200,28 +202,7 @@ fn handle_forward(
     }
     debug_debug!(ctx, "FWD: DNAT done");
 
-    // Reverse CT entry for reply path (new connections only)
-    if is_new {
-        let rev_ct_tuple = Ipv4CtTuple {
-            daddr: old_saddr,
-            saddr: backend.address,
-            dport: old_sport,
-            sport: backend.port,
-            nexthdr: IPPROTO_TCP,
-            flags: CT_EGRESS,
-        };
-        let rev_ct_state = CtState {
-            rev_nat_index: svc.rev_nat_index,
-            backend_id,
-            closing: false,
-            syn: false,
-        };
-        if ct_create4(&rev_ct_tuple, &rev_ct_state).is_err() {
-            debug_warn!(ctx, "FWD: reverse CT create failed (CT map full?)");
-        }
-    }
-
-    // SNAT
+    // SNAT (pass VIP + svc_port for CT key reconstruction on reply path)
     let snat_cfg = match SNAT_CONFIG.get(0) {
         Some(cfg) => cfg,
         None => {
@@ -242,6 +223,8 @@ fn handle_forward(
         old_sport,
         backend.address,
         backend.port,
+        old_daddr,
+        old_dport,
         &target,
     ) {
         Ok(port) => port,
@@ -269,32 +252,26 @@ fn handle_reply(
 ) -> Result<u32, ()> {
     let pass = aya_ebpf::bindings::xdp_action::XDP_PASS;
 
-    let (client_ip, client_port) = match nat::snat_v4_rev_nat(ctx, ip, l4_off) {
-        Ok(result) => result,
-        Err(()) => return Ok(pass), // No SNAT mapping — not our traffic, expected
-    };
+    // revSNAT now also returns VIP + svc_port for CT key reconstruction
+    let (client_ip, client_port, svc_addr, svc_port) =
+        match nat::snat_v4_rev_nat(ctx, ip, l4_off) {
+            Ok(result) => result,
+            Err(()) => return Ok(pass), // No SNAT mapping — not our traffic, expected
+        };
     debug_debug!(ctx, "REPLY: revSNAT ok");
 
-    let backend_ip = read_field(unsafe { addr_of!((*ip).saddr) });
-    let backend_port = match parse::ptr_at::<u16>(ctx, l4_off + parse::TCP_SPORT_OFF) {
-        Ok(p) => read_field(p as *const u16),
-        Err(()) => {
-            debug_error!(ctx, "REPLY: packet too short for TCP sport after revSNAT");
-            return Err(());
-        }
-    };
-
-    let rev_lookup_tuple = Ipv4CtTuple {
-        daddr: client_ip,
-        saddr: backend_ip,
-        dport: client_port,
-        sport: backend_port,
+    // Reconstruct the same service CT tuple used by forward path
+    let svc_tuple = Ipv4CtTuple {
+        daddr: svc_addr,
+        saddr: client_ip,
+        dport: svc_port,
+        sport: client_port,
         nexthdr: IPPROTO_TCP,
-        flags: CT_EGRESS,
+        flags: TUPLE_F_SERVICE,
     };
 
     let mut ct_state = CtState::new();
-    match ct_lazy_lookup4(tcp_flags, &rev_lookup_tuple, CT_INGRESS, &mut ct_state) {
+    match ct_lazy_lookup4(tcp_flags, &svc_tuple, CT_SERVICE, CT_INGRESS, &mut ct_state) {
         CtStatus::New => {
             debug_trace!(ctx, "REPLY: CT miss");
             return Ok(pass);
