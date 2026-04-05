@@ -94,7 +94,7 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
             {
                 let dst_ip = Ipv4Addr::from(u32::from_be(backend.address));
                 let dst_port = u16::from_be(backend.port);
-                println!("  tcp :{listen_port} -> {dst_ip}:{dst_port} (snat: {snat_ip})",);
+                println!("  tcp :{listen_port} -> {dst_ip}:{dst_port} (snat: {snat_ip})");
             }
 
             // Stats
