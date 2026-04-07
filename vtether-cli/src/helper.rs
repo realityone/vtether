@@ -1,7 +1,10 @@
+use std::io::ErrorKind;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Context as _;
+use log::warn;
 
 const STATE_BASE_DIR: &str = "/run/vtether";
 
@@ -27,4 +30,46 @@ pub fn get_interface_ipv4(interface: &str) -> anyhow::Result<Ipv4Addr> {
         }
     }
     anyhow::bail!("no IPv4 address found on interface '{interface}'")
+}
+
+pub fn best_effort_command(mut command: Command, description: &str) {
+    match command
+        .status()
+        .inspect_err(|error| warn!("{description}: {error}"))
+    {
+        Ok(status) if !status.success() => {
+            warn!("{description}: exited with status {status}");
+        }
+        _ => {}
+    }
+}
+
+pub fn best_effort_remove_file(path: &Path) {
+    std::fs::remove_file(path)
+        .inspect_err(|error| {
+            if error.kind() != ErrorKind::NotFound {
+                warn!("failed to remove {}: {error}", path.display());
+            }
+        })
+        .ok();
+}
+
+pub fn best_effort_remove_dir(path: &Path) {
+    std::fs::remove_dir(path)
+        .inspect_err(|error| {
+            if error.kind() != ErrorKind::NotFound {
+                warn!("failed to remove {}: {error}", path.display());
+            }
+        })
+        .ok();
+}
+
+pub fn best_effort_remove_dir_all(path: &Path) {
+    std::fs::remove_dir_all(path)
+        .inspect_err(|error| {
+            if error.kind() != ErrorKind::NotFound {
+                warn!("failed to remove {}: {error}", path.display());
+            }
+        })
+        .ok();
 }
