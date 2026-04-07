@@ -1,6 +1,9 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::Context as _;
+
+use crate::helper::best_effort_command;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/vtether/config.yaml";
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/vtether.service";
@@ -65,9 +68,16 @@ fn get_default_interface() -> anyhow::Result<String> {
 
 pub fn setup() -> anyhow::Result<()> {
     let vtether_bin = std::env::current_exe().context("failed to determine vtether binary path")?;
-    let vtether_bin = vtether_bin.canonicalize().unwrap_or(vtether_bin);
+    let vtether_bin = vtether_bin
+        .canonicalize()
+        .inspect_err(|error| log::warn!("failed to canonicalize current executable: {error}"))
+        .unwrap_or(vtether_bin);
 
-    let default_iface = get_default_interface().unwrap_or_else(|_| "eth0".to_string());
+    let default_iface = get_default_interface()
+        .inspect_err(|error| {
+            log::warn!("failed to detect default interface, falling back to eth0: {error:#}")
+        })
+        .unwrap_or_else(|_| "eth0".to_string());
 
     let config_dir = PathBuf::from(DEFAULT_CONFIG_PATH)
         .parent()
@@ -109,12 +119,13 @@ pub fn setup() -> anyhow::Result<()> {
 }
 
 pub fn remove() -> anyhow::Result<()> {
-    let _ = std::process::Command::new("systemctl")
-        .args(["stop", "vtether"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "vtether"])
-        .status();
+    let mut stop = Command::new("systemctl");
+    stop.args(["stop", "vtether"]);
+    best_effort_command(stop, "failed to stop vtether service");
+
+    let mut disable = Command::new("systemctl");
+    disable.args(["disable", "vtether"]);
+    best_effort_command(disable, "failed to disable vtether service");
 
     if PathBuf::from(SYSTEMD_UNIT_PATH).exists() {
         std::fs::remove_file(SYSTEMD_UNIT_PATH)
@@ -122,9 +133,9 @@ pub fn remove() -> anyhow::Result<()> {
         println!("  removed {SYSTEMD_UNIT_PATH}");
     }
 
-    let _ = std::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .status();
+    let mut daemon_reload = Command::new("systemctl");
+    daemon_reload.args(["daemon-reload"]);
+    best_effort_command(daemon_reload, "failed to reload systemd units");
 
     println!("\nvtether removed.");
     Ok(())

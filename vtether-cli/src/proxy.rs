@@ -1,11 +1,12 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::Context as _;
 use aya::maps::{Array, HashMap};
 use aya::programs::links::FdLink;
 use aya::programs::{Xdp, XdpFlags};
-use log::info;
+use log::{info, warn};
 use serde::Deserialize;
 
 use crate::{
@@ -13,7 +14,10 @@ use crate::{
         GC_INTERVAL_DEFAULT_SECS, GC_INTERVAL_MAX_SECS, GC_INTERVAL_MIN_SECS, IPPROTO_TCP,
         adapt_gc_interval, reap_conntrack,
     },
-    helper::{get_interface_ipv4, state_dir_for},
+    helper::{
+        best_effort_command, best_effort_remove_dir, best_effort_remove_dir_all,
+        best_effort_remove_file, get_interface_ipv4, state_dir_for,
+    },
     setup::setup_sysctl,
 };
 
@@ -121,6 +125,28 @@ pub struct SnatConfig {
     pub max_port: u16,
 }
 unsafe impl aya::Pod for SnatConfig {}
+
+fn cleanup_partial_proxy_state(
+    interface: &str,
+    prog_pin: &std::path::Path,
+    pin_path: &std::path::Path,
+    state_dir: &std::path::Path,
+) {
+    let mut detach_xdp = Command::new("ip");
+    detach_xdp.args(["link", "set", "dev", interface, "xdp", "off"]);
+    best_effort_command(
+        detach_xdp,
+        &format!("failed to detach XDP from {interface}"),
+    );
+
+    best_effort_remove_file(prog_pin);
+    best_effort_remove_file(&pin_path.join("link"));
+    for &(_, pin_name) in MAP_PINS {
+        best_effort_remove_file(&pin_path.join(pin_name));
+    }
+    best_effort_remove_dir(pin_path);
+    best_effort_remove_dir_all(state_dir);
+}
 
 #[allow(clippy::too_many_lines)]
 pub async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result<()> {
@@ -288,9 +314,9 @@ pub async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result
     }
 
     // Init eBPF logger
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        log::warn!("failed to init eBPF logger: {e}");
-    }
+    aya_log::EbpfLogger::init(&mut ebpf)
+        .inspect_err(|error| warn!("failed to init eBPF logger: {error}"))
+        .ok();
 
     // Pin maps
     std::fs::create_dir_all(&pin_path)
@@ -336,19 +362,12 @@ pub async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result
         Ok(())
     };
 
-    if let Err(e) = finish() {
-        let _ = std::process::Command::new("ip")
-            .args(["link", "set", "dev", &config.interface, "xdp", "off"])
-            .status();
-        let _ = std::fs::remove_file(&prog_pin);
-        let _ = std::fs::remove_file(pin_path.join("link"));
-        for &(_, pin_name) in MAP_PINS {
-            let _ = std::fs::remove_file(pin_path.join(pin_name));
-        }
-        let _ = std::fs::remove_dir(&pin_path);
-        let _ = std::fs::remove_dir_all(&state_dir);
-        return Err(e.context("proxy up failed, cleaned up partial state"));
-    }
+    finish()
+        .inspect_err(|error| {
+            warn!("proxy up finalization failed: {error:#}");
+            cleanup_partial_proxy_state(&config.interface, &prog_pin, &pin_path, &state_dir);
+        })
+        .map_err(|error| error.context("proxy up failed, cleaned up partial state"))?;
 
     info!(
         "proxy up: xdp on {}, snat_ip: {}, conntrack: {}",
@@ -372,23 +391,20 @@ pub async fn proxy_up(config_path: PathBuf, pin_path: PathBuf) -> anyhow::Result
         );
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(gc_interval_secs)).await;
-            match reap_conntrack(&reaper_pin_path) {
-                Ok(result) => {
-                    if result.expired > 0 || result.orphans > 0 {
-                        info!(
-                            "gc cycle: total={} expired={} orphans={} next_interval={}s",
-                            result.total,
-                            result.expired,
-                            result.orphans,
-                            adapt_gc_interval(gc_interval_secs, result.total, result.expired),
-                        );
-                    }
-                    gc_interval_secs =
-                        adapt_gc_interval(gc_interval_secs, result.total, result.expired);
+            if let Ok(result) = reap_conntrack(&reaper_pin_path)
+                .inspect_err(|error| warn!("conntrack gc error: {error:#}"))
+            {
+                if result.expired > 0 || result.orphans > 0 {
+                    info!(
+                        "gc cycle: total={} expired={} orphans={} next_interval={}s",
+                        result.total,
+                        result.expired,
+                        result.orphans,
+                        adapt_gc_interval(gc_interval_secs, result.total, result.expired),
+                    );
                 }
-                Err(e) => {
-                    log::warn!("conntrack gc error: {e:#}");
-                }
+                gc_interval_secs =
+                    adapt_gc_interval(gc_interval_secs, result.total, result.expired);
             }
         }
     });
@@ -432,17 +448,20 @@ pub fn proxy_destroy(pin_path: &std::path::Path) -> anyhow::Result<()> {
         link.unpin().context("failed to unpin link")?;
     }
 
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", interface.trim(), "xdp", "off"])
-        .status();
+    let mut detach_xdp = Command::new("ip");
+    detach_xdp.args(["link", "set", "dev", interface.trim(), "xdp", "off"]);
+    best_effort_command(
+        detach_xdp,
+        &format!("failed to detach XDP from {}", interface.trim()),
+    );
 
-    let _ = std::fs::remove_file(&prog_pin);
-    let _ = std::fs::remove_file(pin_path.join("link"));
+    best_effort_remove_file(&prog_pin);
+    best_effort_remove_file(&pin_path.join("link"));
     for &(_, pin_name) in MAP_PINS {
-        let _ = std::fs::remove_file(pin_path.join(pin_name));
+        best_effort_remove_file(&pin_path.join(pin_name));
     }
-    let _ = std::fs::remove_dir(pin_path);
-    let _ = std::fs::remove_dir_all(&state_dir);
+    best_effort_remove_dir(pin_path);
+    best_effort_remove_dir_all(&state_dir);
 
     println!(
         "vtether: proxy destroy (detached from {})",

@@ -2,6 +2,7 @@ use std::net::Ipv4Addr;
 
 use anyhow::Context as _;
 use aya::maps::{HashMap, Map, MapData, PerCpuHashMap, PerCpuValues};
+use log::warn;
 
 use crate::{
     gc::{CtEntry, Ipv4CtTuple, SnatEntry, ktime_get_ns},
@@ -39,7 +40,9 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
     );
 
     let state_dir = state_dir_for(pin_path);
-    let interface = std::fs::read_to_string(state_dir.join("interface"))
+    let interface_path = state_dir.join("interface");
+    let interface = std::fs::read_to_string(&interface_path)
+        .inspect_err(|error| warn!("failed to read {}: {error}", interface_path.display()))
         .unwrap_or_else(|_| "unknown".to_string());
     println!("vtether: attached to {}", interface.trim());
 
@@ -104,7 +107,16 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
             };
             if let Some(s) = route_stats
                 .as_ref()
-                .and_then(|m| m.get(&stats_key, 0).ok())
+                .and_then(|map| {
+                    map.get(&stats_key, 0)
+                        .inspect_err(|error| {
+                            warn!(
+                                "failed to read route stats for rev_nat_index {}: {error}",
+                                svc.rev_nat_index
+                            )
+                        })
+                        .ok()
+                })
                 .map(|v| aggregate_stats(&v))
             {
                 print!(
@@ -129,7 +141,14 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
             let map = Map::LruHashMap(map_data);
             let ct4: HashMap<_, Ipv4CtTuple, CtEntry> =
                 HashMap::try_from(map).context("failed to parse CT4 map")?;
-            Ok(ct4.iter().filter_map(Result::ok).collect())
+            Ok(ct4
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .inspect_err(|error| warn!("skipping unreadable CT4 entry: {error}"))
+                        .ok()
+                })
+                .collect())
         })() {
             Ok(entries) => {
                 println!("\nActive connections: {} CT entries", entries.len());
@@ -155,7 +174,14 @@ pub fn inspect(pin_path: &std::path::Path, verbose: bool) -> anyhow::Result<()> 
                 let map = Map::LruHashMap(map_data);
                 let snat4: HashMap<_, Ipv4CtTuple, SnatEntry> =
                     HashMap::try_from(map).context("failed to parse SNAT4 map")?;
-                Ok(snat4.iter().filter_map(Result::ok).collect())
+                Ok(snat4
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .inspect_err(|error| warn!("skipping unreadable SNAT4 entry: {error}"))
+                            .ok()
+                    })
+                    .collect())
             })() {
                 Ok(entries) => {
                     println!("\nSNAT4 entries ({}):", entries.len());

@@ -1,7 +1,7 @@
 use aya::maps::{HashMap, Map, MapData};
 
 use anyhow::Context as _;
-use log::info;
+use log::{info, warn};
 
 pub const IPPROTO_TCP: u8 = 6;
 
@@ -133,7 +133,9 @@ pub fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
         );
     }
     for key in &expired_keys {
-        let _ = ct4.remove(key);
+        ct4.remove(key)
+            .inspect_err(|error| warn!("failed to remove expired CT entry: {error}"))
+            .ok();
     }
 
     // ---- Phase 2: Purge orphan SNAT entries ----
@@ -194,7 +196,10 @@ pub fn reap_conntrack(pin_path: &std::path::Path) -> anyhow::Result<GcResult> {
             info!("gc: purging {} orphan SNAT entries", orphan_keys.len());
         }
         for key in &orphan_keys {
-            let _ = snat4.remove(key);
+            snat4
+                .remove(key)
+                .inspect_err(|error| warn!("failed to remove orphan SNAT entry: {error}"))
+                .ok();
         }
         snat_orphans = orphan_keys.len() as u64;
     }
